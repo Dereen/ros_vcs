@@ -42,10 +42,13 @@ CLI usage:
 import argparse
 import base64
 import os
+import sys
 import json
 import yaml
 import zipfile
+import tempfile
 from io import StringIO
+from contextlib import redirect_stdout
 from tabulate import tabulate
 from datetime import datetime
 import git
@@ -265,12 +268,13 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True):
     if not os.path.exists(source_folder):
         source_folder = workspace_path
 
-    # Use vcstool export
+    # Use vcstool export (redirect stdout as vcstool ignores the stdout parameter)
     stdout_capture = StringIO()
     args = ['--exact'] if exact else []
     args.append(source_folder)
 
-    vcs_export(args=args, stdout=stdout_capture)
+    with redirect_stdout(stdout_capture):
+        vcs_export(args=args)
     yaml_content = stdout_capture.getvalue()
 
     if output_file:
@@ -303,14 +307,18 @@ def get_repo_diff(repo_path):
             'untracked_files': {}
         }
 
-        # Get staged changes
+        # Get staged changes (ensure trailing newline for git apply)
         staged_diff = repo.git.diff('--cached')
         if staged_diff:
+            if not staged_diff.endswith('\n'):
+                staged_diff += '\n'
             result['staged_diff'] = staged_diff
 
-        # Get unstaged changes
+        # Get unstaged changes (ensure trailing newline for git apply)
         unstaged_diff = repo.git.diff()
         if unstaged_diff:
+            if not unstaged_diff.endswith('\n'):
+                unstaged_diff += '\n'
             result['unstaged_diff'] = unstaged_diff
 
         # Get untracked files with their contents
@@ -398,7 +406,15 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None)
     with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         # Add repos file
         zf.writestr('workspace.repos', repos_content)
-        # Add state file
+        # Base64 encode diffs to ensure they survive YAML serialization
+        for repo_data in state_data.get('dirty_repos', {}).values():
+            if repo_data.get('staged_diff'):
+                repo_data['staged_diff'] = base64.b64encode(repo_data['staged_diff'].encode('utf-8')).decode('ascii')
+                repo_data['staged_diff_encoded'] = True
+            if repo_data.get('unstaged_diff'):
+                repo_data['unstaged_diff'] = base64.b64encode(repo_data['unstaged_diff'].encode('utf-8')).decode('ascii')
+                repo_data['unstaged_diff_encoded'] = True
+
         state_content = yaml.dump(state_data, default_flow_style=False, allow_unicode=True)
         zf.writestr('workspace.state.yaml', state_content)
 
@@ -422,8 +438,9 @@ def import_workspace_state(input_file, output_dir, state_file=None):
     Returns:
         Dictionary with 'import_return_code', 'patched', 'patch_failed'
     """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Create output directory with src subfolder for ROS workspace structure
+    src_dir = os.path.join(output_dir, 'src')
+    os.makedirs(src_dir, exist_ok=True)
 
     repos_content = None
     state_data = None
@@ -447,11 +464,18 @@ def import_workspace_state(input_file, output_dir, state_file=None):
             with open(state_file, 'r') as f:
                 state_data = yaml.safe_load(f)
 
-    # Use vcstool import
-    stdin_capture = StringIO(repos_content)
+    # Use vcstool import with temporary file (redirect stdout as vcstool ignores the stdout parameter)
     stdout_capture = StringIO()
 
-    rc = vcs_import(args=[output_dir], stdin=stdin_capture, stdout=stdout_capture)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.repos', delete=False) as tmp_file:
+        tmp_file.write(repos_content)
+        tmp_file_path = tmp_file.name
+
+    try:
+        with redirect_stdout(stdout_capture):
+            rc = vcs_import(args=['--input', tmp_file_path, src_dir])
+    finally:
+        os.unlink(tmp_file_path)
 
     import_output = stdout_capture.getvalue()
     print(import_output)
@@ -467,7 +491,7 @@ def import_workspace_state(input_file, output_dir, state_file=None):
         print(f"\nApplying uncommitted changes...")
 
         for rel_path, diff_data in state_data.get('dirty_repos', {}).items():
-            repo_path = os.path.join(output_dir, rel_path)
+            repo_path = os.path.join(src_dir, rel_path)
 
             if not os.path.isdir(repo_path):
                 print(f"  Skipping {rel_path}: directory not found")
@@ -480,13 +504,31 @@ def import_workspace_state(input_file, output_dir, state_file=None):
 
                 # Apply staged diff (use --index to stage the changes)
                 if diff_data.get('staged_diff'):
-                    repo.git.apply('--index', input=diff_data['staged_diff'])
-                    applied = True
+                    staged_diff = diff_data['staged_diff']
+                    if diff_data.get('staged_diff_encoded'):
+                        staged_diff = base64.b64decode(staged_diff).decode('utf-8')
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as pf:
+                        pf.write(staged_diff)
+                        patch_file = pf.name
+                    try:
+                        repo.git.apply('--index', patch_file)
+                        applied = True
+                    finally:
+                        os.unlink(patch_file)
 
                 # Apply unstaged diff
                 if diff_data.get('unstaged_diff'):
-                    repo.git.apply(input=diff_data['unstaged_diff'])
-                    applied = True
+                    unstaged_diff = diff_data['unstaged_diff']
+                    if diff_data.get('unstaged_diff_encoded'):
+                        unstaged_diff = base64.b64decode(unstaged_diff).decode('utf-8')
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as pf:
+                        pf.write(unstaged_diff)
+                        patch_file = pf.name
+                    try:
+                        repo.git.apply(patch_file)
+                        applied = True
+                    finally:
+                        os.unlink(patch_file)
 
                 # Restore untracked files
                 for filepath, file_data in diff_data.get('untracked_files', {}).items():
