@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ros-vcs"
+version = "1.0.0"
+description = "RVCS - ROS VCS Workspace Manager: manage ROS/catkin workspaces with git repositories"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "GitPython>=3.1.0",
+    "PyYAML>=6.0",
+    "tabulate>=0.9.0",
+    "vcstool>=0.3.0",
+]
+
+[project.scripts]
+rvcs = "rvcs:main"
+
+[tool.setuptools]
+py-modules = ["rvcs"]
