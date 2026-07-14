@@ -103,7 +103,10 @@ def get_git_info_dict(folder, debug=False):
     old_debug = _debug
     _debug = debug
 
-    if not os.path.isdir(os.path.join(folder, '.git')):
+    # .git is a directory for normal repos and a "gitdir: ..." pointer FILE for
+    # submodule-style checkouts — both are valid repositories (GitPython follows
+    # the pointer transparently)
+    if not os.path.exists(os.path.join(folder, '.git')):
         _debug = old_debug
         return None
 
@@ -174,14 +177,38 @@ def scan_workspace(workspace_path, ignore_packages=None, debug=False):
         source_folder = workspace_path
 
     results = []
-    for folder in os.listdir(source_folder):
-        folder_path = os.path.join(source_folder, folder)
-        if os.path.isdir(folder_path) and folder not in ignore_packages:
-            info = get_git_info_dict(folder_path, debug=debug)
-            if info:
-                results.append(info)
+    for folder_path in find_git_repos(source_folder, ignore_packages):
+        info = get_git_info_dict(folder_path, debug=debug)
+        if info:
+            # Show nested repos by their path relative to the source folder
+            rel = os.path.relpath(folder_path, source_folder)
+            if os.sep in rel:
+                info['package'] = rel
+            results.append(info)
 
     return results
+
+
+def find_git_repos(source_folder, ignore_packages=None):
+    """
+    Recursively find git repositories under source_folder, including
+    repositories nested inside other repositories (e.g. submodule-style
+    checkouts). Returns a sorted list of repository paths.
+    """
+    if ignore_packages is None:
+        ignore_packages = set()
+
+    repos = []
+    for root, dirs, files in os.walk(source_folder):
+        if '.git' in dirs:
+            dirs.remove('.git')
+        if os.path.basename(root) in ignore_packages:
+            dirs[:] = []
+            continue
+        if os.path.exists(os.path.join(root, '.git')) and root != source_folder:
+            repos.append(root)
+        # keep walking into the repo so nested repositories are found too
+    return sorted(repos)
 
 
 def export_to_json(results, output_path=None, workspace_name=None):
@@ -268,14 +295,38 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True):
     if not os.path.exists(source_folder):
         source_folder = workspace_path
 
-    # Use vcstool export (redirect stdout as vcstool ignores the stdout parameter)
-    stdout_capture = StringIO()
-    args = ['--exact'] if exact else []
-    args.append(source_folder)
+    # Build the manifest ourselves (vcstool-compatible YAML) instead of calling
+    # `vcs export`: vcstool cannot see submodule-style repos (.git pointer FILE)
+    # and silently DROPS any repo whose HEAD commit is not on a remote — for a
+    # backup tool both must be recorded. Nested repositories (repos inside
+    # repos) are always included; the diff capture in export_workspace_state()
+    # walks them too, so manifest and state agree.
+    repositories = {}
+    for repo_path in find_git_repos(source_folder):
+        rel = os.path.relpath(repo_path, source_folder)
+        try:
+            repo = git.Repo(repo_path)
+            url = list(repo.remotes.origin.urls)[0] if 'origin' in repo.remotes else None
+            version = repo.head.commit.hexsha if exact else None
+            if not exact or version is None:
+                try:
+                    version = repo.active_branch.name
+                except TypeError:
+                    version = repo.head.commit.hexsha
+            if url is None:
+                print(f"Warning: {rel}: no 'origin' remote — recorded without url, "
+                      f"import will not be able to clone it")
+            elif exact:
+                # warn (but still record) when the exact hash exists on no remote
+                on_remote = repo.git.branch('-r', '--contains', version) if repo.remotes else ''
+                if not on_remote.strip():
+                    print(f"Warning: {rel}: HEAD {version[:7]} not found on any remote "
+                          f"— push it before this manifest can be restored")
+            repositories[rel] = {'type': 'git', 'url': url, 'version': version}
+        except Exception as e:
+            print(f"Warning: could not export {rel}: {e}")
 
-    with redirect_stdout(stdout_capture):
-        vcs_export(args=args)
-    yaml_content = stdout_capture.getvalue()
+    yaml_content = yaml.dump({'repositories': repositories}, default_flow_style=False)
 
     if output_file:
         with open(output_file, 'w') as f:
@@ -394,7 +445,7 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None)
             dirs.remove('.git')
 
         git_dir = os.path.join(root, '.git')
-        if os.path.isdir(git_dir):
+        if os.path.exists(git_dir):
             rel_path = os.path.relpath(root, source_folder)
             diff_data = get_repo_diff(root)
             if diff_data:
@@ -473,7 +524,11 @@ def import_workspace_state(input_file, output_dir, state_file=None):
 
     try:
         with redirect_stdout(stdout_capture):
-            rc = vcs_import(args=['--input', tmp_file_path, src_dir])
+            # single worker: nested repos must be cloned parent-first (the
+            # manifest is sorted so a parent path precedes its nested repos);
+            # parallel workers could clone a child into a not-yet-cloned parent
+            # path and make the parent clone fail on a non-empty directory
+            rc = vcs_import(args=['--input', tmp_file_path, '--workers', '1', src_dir])
     finally:
         os.unlink(tmp_file_path)
 
@@ -672,11 +727,12 @@ Examples:
 
         # Process local packages
         processed_remote_keys = set()
-        for folder in os.listdir(source_folder):
-            folder_path = os.path.join(source_folder, folder)
-            if os.path.isdir(folder_path) and folder not in ignore_packages:
+        for folder_path in find_git_repos(source_folder, ignore_packages):
                 result = get_git_info(folder_path)
                 if result:
+                    rel = os.path.relpath(folder_path, source_folder)
+                    if os.sep in rel:
+                        result[0] = rel
                     package_name = result[0]
                     local_branch = result[1]
                     local_hash = result[2]
@@ -802,11 +858,12 @@ Examples:
         print(tabulate(colorized_results, headers=headers, tablefmt="simple"))
 
     else:
-        for folder in os.listdir(source_folder):
-            folder_path = os.path.join(source_folder, folder)
-            if os.path.isdir(folder_path) and folder not in ignore_packages:
+        for folder_path in find_git_repos(source_folder, ignore_packages):
                 result = get_git_info(folder_path)
                 if result:
+                    rel = os.path.relpath(folder_path, source_folder)
+                    if os.sep in rel:
+                        result[0] = rel
                     row_colors = []
                     if result[3] == 'yes' and result[4] == 'yes':
                         row_colors = ['\033[38;5;196m'] * len(result)
