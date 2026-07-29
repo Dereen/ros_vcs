@@ -278,7 +278,7 @@ def find_catkin_workspace(folder):
             return find_catkin_workspace(parent_folder)
 
 
-def export_vcs_repos(workspace_path, output_file=None, exact=True):
+def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packages=None):
     """
     Export workspace repositories using vcstool format (YAML).
 
@@ -286,6 +286,9 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True):
         workspace_path: Path to the workspace directory
         output_file: Optional output file path. If None, returns YAML string.
         exact: If True, export exact commit hashes instead of branch names
+        ignore_packages: Set of directory basenames to exclude (each prunes its
+            whole subtree, so nested repos inside an ignored repo are excluded too).
+            Enables PER-RESEARCH workspace images from a shared workspace.
 
     Returns:
         Path to output file if output_file provided, otherwise YAML string
@@ -302,7 +305,7 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True):
     # repos) are always included; the diff capture in export_workspace_state()
     # walks them too, so manifest and state agree.
     repositories = {}
-    for repo_path in find_git_repos(source_folder):
+    for repo_path in find_git_repos(source_folder, ignore_packages):
         rel = os.path.relpath(repo_path, source_folder)
         try:
             repo = git.Repo(repo_path)
@@ -404,7 +407,7 @@ def get_repo_diff(repo_path):
         return None
 
 
-def export_workspace_state(workspace_path, output_dir=None, workspace_name=None):
+def export_workspace_state(workspace_path, output_dir=None, workspace_name=None, ignore_packages=None):
     """
     Export complete workspace state to a zip file containing vcstool repos and diffs.
 
@@ -429,7 +432,7 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None)
         source_folder = workspace_path
 
     # Get vcstool repos content
-    repos_content = export_vcs_repos(workspace_path, exact=True)
+    repos_content = export_vcs_repos(workspace_path, exact=True, ignore_packages=ignore_packages)
 
     # Collect diffs for dirty repos
     state_data = {
@@ -438,19 +441,14 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None)
         'dirty_repos': {}
     }
 
-    # Find all git repos and check for dirty state
-    for root, dirs, files in os.walk(source_folder):
-        # Skip .git directories
-        if '.git' in dirs:
-            dirs.remove('.git')
-
-        git_dir = os.path.join(root, '.git')
-        if os.path.exists(git_dir):
-            rel_path = os.path.relpath(root, source_folder)
-            diff_data = get_repo_diff(root)
-            if diff_data:
-                state_data['dirty_repos'][rel_path] = diff_data
-                print(f"  Captured changes for: {rel_path}")
+    # Find all git repos and check for dirty state (same discovery + ignore
+    # semantics as the manifest, so both sides of the export always agree)
+    for root in find_git_repos(source_folder, ignore_packages):
+        rel_path = os.path.relpath(root, source_folder)
+        diff_data = get_repo_diff(root)
+        if diff_data:
+            state_data['dirty_repos'][rel_path] = diff_data
+            print(f"  Captured changes for: {rel_path}")
 
     # Create zip file
     zip_file = os.path.join(output_dir, f"{ws_name}_{date_str}.workspace.zip")
@@ -644,7 +642,8 @@ Examples:
     parser.add_argument('--export-state', action='store_true', help='Export workspace state to zip')
     parser.add_argument('--import-state', help='Import workspace from .workspace.zip or .repos file')
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
-    parser.add_argument('--ignore', help='Ignore file with package names to exclude')
+    parser.add_argument('--ignore', help='Ignore file with package names to exclude (status AND --export-state)')
+    parser.add_argument('--name', help='Workspace name for --export-state output file (default: workspace dir name)')
     parser.add_argument('workspace', nargs='?', default=None, help='Workspace folder or output dir')
     args = parser.parse_args()
 
@@ -669,7 +668,10 @@ Examples:
             print("Cannot use other options with --export-state")
             exit(1)
         workspace = args.workspace if args.workspace else os.getcwd()
-        export_workspace_state(workspace)
+        ignore = load_ignore_packages(args.ignore) if args.ignore else None
+        if ignore:
+            print(f"Excluding (with their subtrees): {', '.join(sorted(ignore))}")
+        export_workspace_state(workspace, workspace_name=args.name, ignore_packages=ignore)
         exit(0)
 
     # Handle --import-state mode
