@@ -11,6 +11,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Workspace Import**: Recreate workspace from zip file, including applying uncommitted changes
 - **Comparison Mode**: Compare local workspace against a remote snapshot
 - **vcstool Compatible**: Export format is compatible with standard `vcs import` command
+- **Pipelines**: Back up one *slice* of a shared workspace (the repos one line of research uses) together with its tmuxinator session configs
 
 ## Installation
 
@@ -71,6 +72,53 @@ Import with separate state file:
 ./rvcs.py --import-state workspace.repos --state-file workspace.state.yaml ~/new_workspace
 ```
 
+### Pipelines
+
+A large workspace usually hosts several independent lines of work ("pipelines") that
+share infrastructure repos. A **pipeline definition file** (`*.pipeline.yaml`) names the
+subset of the workspace one pipeline uses, plus the tmuxinator configs that bring it up:
+
+```yaml
+name: overhang_rejection            # required — used for the output filename
+workspace: ~/marv_ws                # optional default workspace
+repos:                              # paths relative to src/ — subtree semantics,
+  - overhang_research               #   nested repos inside an entry are included too
+  - robot_rodeo_gym_ros2
+tmuxinator:                         # session configs bundled verbatim
+  - ~/.config/tmuxinator/marv_overhang.yml
+extra_paths:                        # optional NON-repo paths (workspace-relative)
+  - src/marv_elevation_mapping      #   copied into the zip as raw files
+```
+
+Keep the definition file inside the pipeline's main repo so it is versioned with the
+research it describes.
+
+Export a pipeline (creates `<name>_<date>.pipeline.zip`):
+
+```bash
+./rvcs.py --export-pipeline overhang.pipeline.yaml            # workspace from the file
+./rvcs.py --export-pipeline overhang.pipeline.yaml ~/other_ws # explicit workspace
+```
+
+The zip contains the usual `workspace.repos` + `workspace.state.yaml` (restricted to the
+pipeline's repos, uncommitted changes included), plus `pipeline.yaml` (the definition),
+`tmuxinator/<name>.yml`, and `extra/<path>` raw files.
+
+Status of only the pipeline's repos:
+
+```bash
+./rvcs.py --pipeline overhang.pipeline.yaml
+```
+
+Import works with the standard command; tmuxinator configs are restored to
+`<workspace>/tmuxinator/` (add `--install-tmuxinator` to also copy them into
+`~/.config/tmuxinator/`), and `extra_paths` are restored to their original
+workspace-relative locations:
+
+```bash
+./rvcs.py --import-state overhang_rejection_2026-07-29.pipeline.zip ~/new_ws --install-tmuxinator
+```
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:
@@ -100,8 +148,11 @@ Color codes:
 | Option | Description |
 |--------|-------------|
 | `--export-state` | Export workspace to zip file |
-| `--import-state FILE` | Import from .workspace.zip or .repos file |
+| `--export-pipeline FILE` | Export a pipeline slice (repos + tmuxinator configs) to zip |
+| `--pipeline FILE` | Restrict status/compare to a pipeline's repos |
+| `--import-state FILE` | Import from .workspace.zip, .pipeline.zip or .repos file |
 | `--state-file FILE` | State file with diffs (use with --import-state) |
+| `--install-tmuxinator` | With --import-state: copy bundled tmuxinator configs to ~/.config/tmuxinator |
 | `-c, --compare FILE` | Compare with JSON snapshot |
 | `-j, --json` | Export to JSON file |
 | `--ignore FILE` | File with package names to exclude |
@@ -153,6 +204,10 @@ for repo in results:
 
 # Export workspace state
 zip_path = export_workspace_state('/path/to/workspace')
+
+# Export a pipeline slice (repos subset + tmuxinator configs)
+from rvcs import export_pipeline_state
+zip_path = export_pipeline_state('overhang.pipeline.yaml')
 
 # Import workspace state
 import_workspace_state('workspace.workspace.zip', '/path/to/new/workspace')

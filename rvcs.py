@@ -29,6 +29,13 @@ CLI usage:
     # Export workspace state to zip (contains .repos and .state.yaml)
     rvcs --export-state [workspace]
 
+    # Export a PIPELINE: the subset of the workspace listed in a pipeline
+    # definition file, plus its tmuxinator session configs
+    rvcs --export-pipeline overhang.pipeline.yaml [workspace]
+
+    # Status table restricted to the repos of one pipeline
+    rvcs --pipeline overhang.pipeline.yaml [workspace]
+
     # Import workspace from zip file (includes uncommitted changes)
     rvcs --import-state workspace.workspace.zip [output_dir]
 
@@ -57,7 +64,7 @@ import git
 from vcstool.commands.export import main as vcs_export
 from vcstool.commands.import_ import main as vcs_import
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Module-level debug flag (set by CLI)
 _debug = False
@@ -79,6 +86,55 @@ def load_ignore_packages(ignore_file):
         print(f"Warning: Could not read ignore file {ignore_file}: {e}")
 
     return ignore_packages
+
+
+def load_pipeline(pipeline_file):
+    """
+    Load a pipeline definition file (YAML).
+
+    A pipeline names the subset of a workspace that one line of work uses,
+    plus the tmuxinator session configs that bring it up:
+
+        name: overhang_rejection          # required
+        workspace: ~/marv_ws              # optional default workspace
+        repos:                            # paths relative to src/ — each entry
+          - overhang_research             #   includes its whole subtree (nested
+          - robot_rodeo_gym_ros2          #   repos inside it are included too)
+        tmuxinator:                       # tmuxinator configs bundled verbatim
+          - ~/.config/tmuxinator/marv_overhang.yml
+        extra_paths:                      # optional NON-repo paths (relative to
+          - src/marv_elevation_mapping    #   the workspace root) copied raw
+
+    Returns the pipeline dict with defaults filled in.
+    """
+    with open(pipeline_file, 'r') as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict) or not data.get('name'):
+        raise ValueError(f"{pipeline_file}: pipeline file must be a YAML mapping "
+                         f"with at least a 'name' key")
+    data.setdefault('repos', [])
+    data.setdefault('tmuxinator', [])
+    data.setdefault('extra_paths', [])
+    if data.get('workspace'):
+        data['workspace'] = os.path.expanduser(data['workspace'])
+    data['tmuxinator'] = [os.path.expanduser(p) for p in data['tmuxinator']]
+    return data
+
+
+def repo_in_include_paths(rel_path, include_paths):
+    """
+    True if a repo (path relative to src/) is selected by an include list.
+    None means no filtering (everything included). Matching is by exact path
+    or subtree: 'a/b' matches include entry 'a' (nested repos come along).
+    """
+    if include_paths is None:
+        return True
+    rel = rel_path.replace(os.sep, '/')
+    for entry in include_paths:
+        e = str(entry).strip().strip('/').replace(os.sep, '/')
+        if rel == e or rel.startswith(e + '/'):
+            return True
+    return False
 
 
 def _debug_print(message):
@@ -278,7 +334,8 @@ def find_catkin_workspace(folder):
             return find_catkin_workspace(parent_folder)
 
 
-def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packages=None):
+def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packages=None,
+                     include_paths=None):
     """
     Export workspace repositories using vcstool format (YAML).
 
@@ -289,6 +346,9 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packag
         ignore_packages: Set of directory basenames to exclude (each prunes its
             whole subtree, so nested repos inside an ignored repo are excluded too).
             Enables PER-RESEARCH workspace images from a shared workspace.
+        include_paths: Optional list of src-relative paths to INCLUDE (subtree
+            semantics, see repo_in_include_paths). None = include everything.
+            This is how pipelines carve their slice out of the workspace.
 
     Returns:
         Path to output file if output_file provided, otherwise YAML string
@@ -307,6 +367,8 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packag
     repositories = {}
     for repo_path in find_git_repos(source_folder, ignore_packages):
         rel = os.path.relpath(repo_path, source_folder)
+        if not repo_in_include_paths(rel, include_paths):
+            continue
         try:
             repo = git.Repo(repo_path)
             url = list(repo.remotes.origin.urls)[0] if 'origin' in repo.remotes else None
@@ -407,7 +469,8 @@ def get_repo_diff(repo_path):
         return None
 
 
-def export_workspace_state(workspace_path, output_dir=None, workspace_name=None, ignore_packages=None):
+def export_workspace_state(workspace_path, output_dir=None, workspace_name=None, ignore_packages=None,
+                           include_paths=None, extra_files=None, zip_suffix='.workspace.zip'):
     """
     Export complete workspace state to a zip file containing vcstool repos and diffs.
 
@@ -415,6 +478,11 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
         workspace_path: Path to the workspace directory
         output_dir: Directory for output zip file. If None, uses current directory.
         workspace_name: Name for output file (default: basename of workspace)
+        include_paths: Optional src-relative include list (pipeline slice);
+            applied to BOTH the manifest and the dirty-state capture.
+        extra_files: Optional dict {arcname: source} of additional zip entries;
+            source is a filesystem path (str) or literal content (bytes).
+        zip_suffix: Output filename suffix (pipelines use '.pipeline.zip')
 
     Returns:
         Path to created zip file
@@ -432,7 +500,8 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
         source_folder = workspace_path
 
     # Get vcstool repos content
-    repos_content = export_vcs_repos(workspace_path, exact=True, ignore_packages=ignore_packages)
+    repos_content = export_vcs_repos(workspace_path, exact=True, ignore_packages=ignore_packages,
+                                     include_paths=include_paths)
 
     # Collect diffs for dirty repos
     state_data = {
@@ -445,13 +514,15 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
     # semantics as the manifest, so both sides of the export always agree)
     for root in find_git_repos(source_folder, ignore_packages):
         rel_path = os.path.relpath(root, source_folder)
+        if not repo_in_include_paths(rel_path, include_paths):
+            continue
         diff_data = get_repo_diff(root)
         if diff_data:
             state_data['dirty_repos'][rel_path] = diff_data
             print(f"  Captured changes for: {rel_path}")
 
     # Create zip file
-    zip_file = os.path.join(output_dir, f"{ws_name}_{date_str}.workspace.zip")
+    zip_file = os.path.join(output_dir, f"{ws_name}_{date_str}{zip_suffix}")
     with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         # Add repos file
         zf.writestr('workspace.repos', repos_content)
@@ -467,6 +538,13 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
         state_content = yaml.dump(state_data, default_flow_style=False, allow_unicode=True)
         zf.writestr('workspace.state.yaml', state_content)
 
+        # Additional entries (pipeline definition, tmuxinator configs, raw extras)
+        for arcname, source in (extra_files or {}).items():
+            if isinstance(source, bytes):
+                zf.writestr(arcname, source)
+            else:
+                zf.write(source, arcname)
+
     dirty_count = len(state_data['dirty_repos'])
     print(f"\nExported to: {zip_file}")
     print(f"  Repositories: {repos_content.count('type:')}")
@@ -475,14 +553,90 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
     return zip_file
 
 
-def import_workspace_state(input_file, output_dir, state_file=None):
+def export_pipeline_state(pipeline_file, workspace_path=None, output_dir=None):
+    """
+    Export one pipeline's slice of a workspace to a .pipeline.zip.
+
+    The zip contains everything a plain workspace export has (workspace.repos
+    manifest + workspace.state.yaml with uncommitted changes), restricted to the
+    repos the pipeline lists, PLUS:
+      pipeline.yaml       - the pipeline definition itself
+      tmuxinator/<name>   - the tmuxinator session configs, verbatim
+      extra/<rel_path>    - raw copies of non-repo paths (workspace-relative)
+
+    Args:
+        pipeline_file: Path to the *.pipeline.yaml definition
+        workspace_path: Workspace override; falls back to the pipeline's
+            'workspace' key, then to the current directory.
+        output_dir: Directory for the zip (default: current directory)
+
+    Returns:
+        Path to created zip file
+    """
+    pipeline = load_pipeline(pipeline_file)
+    workspace = workspace_path or pipeline.get('workspace') or os.getcwd()
+    if not os.path.isdir(workspace):
+        raise FileNotFoundError(f"Workspace not found: {workspace}")
+
+    print(f"Pipeline: {pipeline['name']}  (workspace: {workspace})")
+    if pipeline['repos']:
+        print(f"  Repos: {', '.join(pipeline['repos'])}")
+
+    extra_files = {'pipeline.yaml': open(pipeline_file, 'rb').read()}
+
+    for tmux_path in pipeline['tmuxinator']:
+        if os.path.isfile(tmux_path):
+            extra_files[f"tmuxinator/{os.path.basename(tmux_path)}"] = tmux_path
+        else:
+            print(f"Warning: tmuxinator config not found, skipping: {tmux_path}")
+
+    for rel in pipeline['extra_paths']:
+        full = os.path.join(workspace, rel)
+        if os.path.isfile(full):
+            extra_files[f"extra/{rel}"] = full
+        elif os.path.isdir(full):
+            for root, dirs, files in os.walk(full):
+                dirs[:] = [d for d in dirs if d != '.git']
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    extra_files[f"extra/{os.path.relpath(fp, workspace)}"] = fp
+        else:
+            print(f"Warning: extra path not found, skipping: {full}")
+
+    # Warn about include entries that select no repo (typo guard)
+    source_folder = os.path.join(workspace, "src")
+    if not os.path.exists(source_folder):
+        source_folder = workspace
+    found = [os.path.relpath(p, source_folder) for p in find_git_repos(source_folder)]
+    for entry in pipeline['repos']:
+        if not any(repo_in_include_paths(rel, [entry]) for rel in found):
+            print(f"Warning: pipeline repo entry matches nothing in {source_folder}: {entry}")
+
+    return export_workspace_state(
+        workspace,
+        output_dir=output_dir,
+        workspace_name=pipeline['name'],
+        include_paths=pipeline['repos'] or None,
+        extra_files=extra_files,
+        zip_suffix='.pipeline.zip',
+    )
+
+
+def import_workspace_state(input_file, output_dir, state_file=None, install_tmuxinator=False):
     """
     Import workspace state using vcstool and optionally apply diffs.
 
+    Pipeline zips (.pipeline.zip) additionally restore:
+      tmuxinator/* -> <output_dir>/tmuxinator/ (and, with install_tmuxinator,
+                      copied into ~/.config/tmuxinator/)
+      extra/*      -> <output_dir>/ (workspace-relative non-repo paths)
+      pipeline.yaml-> <output_dir>/
+
     Args:
-        input_file: Path to .workspace.zip, .repos file, or directory containing them
+        input_file: Path to .workspace.zip/.pipeline.zip, .repos file, or directory
         output_dir: Directory where repositories will be cloned
         state_file: Optional path to .state.yaml file with diffs (ignored if zip provided)
+        install_tmuxinator: Also copy bundled tmuxinator configs to ~/.config/tmuxinator
 
     Returns:
         Dictionary with 'import_return_code', 'patched', 'patch_failed'
@@ -493,6 +647,7 @@ def import_workspace_state(input_file, output_dir, state_file=None):
 
     repos_content = None
     state_data = None
+    pipeline_members = []
 
     # Handle zip file input
     if input_file.endswith('.zip'):
@@ -502,6 +657,38 @@ def import_workspace_state(input_file, output_dir, state_file=None):
             if 'workspace.state.yaml' in zf.namelist():
                 state_content = zf.read('workspace.state.yaml').decode('utf-8')
                 state_data = yaml.safe_load(state_content)
+            pipeline_members = [n for n in zf.namelist()
+                                if n == 'pipeline.yaml'
+                                or n.startswith('tmuxinator/')
+                                or n.startswith('extra/')]
+            if pipeline_members:
+                # Restore pipeline payload into the new workspace. extra/<rel>
+                # entries land at their workspace-relative path; tmuxinator
+                # configs land in <output_dir>/tmuxinator/ so nothing outside
+                # the target is touched without install_tmuxinator.
+                for member in pipeline_members:
+                    if member.endswith('/'):
+                        continue
+                    if member.startswith('extra/'):
+                        dest = os.path.join(output_dir, os.path.relpath(member, 'extra'))
+                    else:
+                        dest = os.path.join(output_dir, member)
+                    os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
+                    with open(dest, 'wb') as out:
+                        out.write(zf.read(member))
+                tmux_files = [n for n in pipeline_members if n.startswith('tmuxinator/')]
+                if tmux_files:
+                    print(f"  Restored tmuxinator configs to {os.path.join(output_dir, 'tmuxinator')}/")
+                    if install_tmuxinator:
+                        tmux_config_dir = os.path.expanduser('~/.config/tmuxinator')
+                        os.makedirs(tmux_config_dir, exist_ok=True)
+                        for n in tmux_files:
+                            dest = os.path.join(tmux_config_dir, os.path.basename(n))
+                            with open(dest, 'wb') as out:
+                                out.write(zf.read(n))
+                            print(f"  Installed {dest}")
+                    else:
+                        print(f"  (use --install-tmuxinator to copy them into ~/.config/tmuxinator)")
     else:
         # Handle .repos file input
         print(f"Importing repositories from {input_file}...")
@@ -633,6 +820,9 @@ Examples:
   rvcs ~/catkin_ws                  Show status of specified workspace
   rvcs --export-state               Export workspace to zip file
   rvcs --import-state ws.zip ~/new  Import workspace from zip
+  rvcs --export-pipeline p.pipeline.yaml
+                                    Export a pipeline's repos + tmuxinator configs
+  rvcs --pipeline p.pipeline.yaml   Status of only the pipeline's repos
         """
     )
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
@@ -640,8 +830,14 @@ Examples:
     parser.add_argument('-j', '--json', action='store_true', help='Save results to JSON file')
     parser.add_argument('-c', '--compare', help='Compare with JSON file')
     parser.add_argument('--export-state', action='store_true', help='Export workspace state to zip')
-    parser.add_argument('--import-state', help='Import workspace from .workspace.zip or .repos file')
+    parser.add_argument('--export-pipeline', metavar='PIPELINE_FILE',
+                        help='Export a pipeline slice (.pipeline.yaml) incl. tmuxinator configs')
+    parser.add_argument('--pipeline', metavar='PIPELINE_FILE',
+                        help='Restrict status/compare to the repos of a pipeline definition')
+    parser.add_argument('--import-state', help='Import workspace from .workspace.zip/.pipeline.zip or .repos file')
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
+    parser.add_argument('--install-tmuxinator', action='store_true',
+                        help='With --import-state: copy bundled tmuxinator configs into ~/.config/tmuxinator')
     parser.add_argument('--ignore', help='Ignore file with package names to exclude (status AND --export-state)')
     parser.add_argument('--name', help='Workspace name for --export-state output file (default: workspace dir name)')
     parser.add_argument('workspace', nargs='?', default=None, help='Workspace folder or output dir')
@@ -661,6 +857,18 @@ Examples:
         args.state_file = os.path.expanduser(args.state_file)
     if args.ignore:
         args.ignore = os.path.expanduser(args.ignore)
+    if args.export_pipeline:
+        args.export_pipeline = os.path.expanduser(args.export_pipeline)
+    if args.pipeline:
+        args.pipeline = os.path.expanduser(args.pipeline)
+
+    # Handle --export-pipeline mode
+    if args.export_pipeline:
+        if args.compare or args.json or args.import_state or args.export_state:
+            print("Cannot use other options with --export-pipeline")
+            exit(1)
+        export_pipeline_state(args.export_pipeline, workspace_path=args.workspace)
+        exit(0)
 
     # Handle --export-state mode
     if args.export_state:
@@ -684,12 +892,24 @@ Examples:
         if os.path.exists(output_dir) and os.listdir(output_dir):
             print(f"Error: Output directory '{output_dir}' exists and is not empty")
             exit(1)
-        import_workspace_state(args.import_state, output_dir, args.state_file)
+        import_workspace_state(args.import_state, output_dir, args.state_file,
+                               install_tmuxinator=args.install_tmuxinator)
         exit(0)
 
     if args.compare and args.json:
         print("Cannot use -j with -c")
         exit(1)
+
+    # Pipeline filter for status/compare: restrict to the pipeline's repos and
+    # default the workspace to the one the pipeline names
+    pipeline = None
+    include_paths = None
+    if args.pipeline:
+        pipeline = load_pipeline(args.pipeline)
+        include_paths = pipeline['repos'] or None
+        if args.workspace is None and pipeline.get('workspace'):
+            args.workspace = pipeline['workspace']
+        print(f"Pipeline: {pipeline['name']}")
 
     if args.workspace is None:
         args.workspace = os.getcwd()
@@ -715,6 +935,9 @@ Examples:
     print(f"Searching in folder {source_folder}")
     print("=" * 64)
 
+    repo_paths = [p for p in find_git_repos(source_folder, ignore_packages)
+                  if repo_in_include_paths(os.path.relpath(p, source_folder), include_paths)]
+
     results = []
     colors = []
     if args.compare:
@@ -729,7 +952,7 @@ Examples:
 
         # Process local packages
         processed_remote_keys = set()
-        for folder_path in find_git_repos(source_folder, ignore_packages):
+        for folder_path in repo_paths:
                 result = get_git_info(folder_path)
                 if result:
                     rel = os.path.relpath(folder_path, source_folder)
@@ -860,7 +1083,7 @@ Examples:
         print(tabulate(colorized_results, headers=headers, tablefmt="simple"))
 
     else:
-        for folder_path in find_git_repos(source_folder, ignore_packages):
+        for folder_path in repo_paths:
                 result = get_git_info(folder_path)
                 if result:
                     rel = os.path.relpath(folder_path, source_folder)
