@@ -12,6 +12,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Comparison Mode**: Compare local workspace against a remote snapshot
 - **vcstool Compatible**: Export format is compatible with standard `vcs import` command
 - **Pipelines**: Back up one *slice* of a shared workspace (the repos one line of research uses) together with its tmuxinator session configs
+- **Git-bundle fallback**: Repos whose HEAD no remote can serve (unpushed commits, no remote, or a configured remote that doesn't exist) are embedded in the zip as git bundles, so exports are restorable without pushing first
 
 ## Installation
 
@@ -51,6 +52,13 @@ Export workspace to a single zip file containing:
 ./rvcs.py --export-state ~/catkin_ws
 # Creates: catkin_ws_2024-01-22_12-30-45.workspace.zip
 ```
+
+Repos whose HEAD commit is not reachable from any remote are additionally saved as
+`bundles/<repo>.bundle` inside the zip: an *incremental* bundle (unpushed commits only)
+when the repo has remote-tracking refs, otherwise a *self-contained* bundle with the
+full history (covers repos with no remote, or a remote that was never created). Import
+restores these automatically — incremental bundles clone the base from the remote and
+fetch the missing commits from the bundle; self-contained bundles need no remote at all.
 
 ### Import Workspace State
 

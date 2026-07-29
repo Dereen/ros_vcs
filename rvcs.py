@@ -49,6 +49,7 @@ CLI usage:
 import argparse
 import base64
 import os
+import shutil
 import sys
 import json
 import yaml
@@ -335,7 +336,7 @@ def find_catkin_workspace(folder):
 
 
 def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packages=None,
-                     include_paths=None):
+                     include_paths=None, suppress_unpushed_warnings=None):
     """
     Export workspace repositories using vcstool format (YAML).
 
@@ -378,10 +379,12 @@ def export_vcs_repos(workspace_path, output_file=None, exact=True, ignore_packag
                     version = repo.active_branch.name
                 except TypeError:
                     version = repo.head.commit.hexsha
+            suppressed = rel in (suppress_unpushed_warnings or set())
             if url is None:
-                print(f"Warning: {rel}: no 'origin' remote — recorded without url, "
-                      f"import will not be able to clone it")
-            elif exact:
+                if not suppressed:
+                    print(f"Warning: {rel}: no 'origin' remote — recorded without url, "
+                          f"import will not be able to clone it")
+            elif exact and not suppressed:
                 # warn (but still record) when the exact hash exists on no remote
                 on_remote = repo.git.branch('-r', '--contains', version) if repo.remotes else ''
                 if not on_remote.strip():
@@ -469,6 +472,36 @@ def get_repo_diff(repo_path):
         return None
 
 
+def create_repo_bundle(repo_path, bundle_file, url=None):
+    """
+    Create a git bundle for a repo whose HEAD no remote can serve.
+
+    If the repo has a usable url AND remote-tracking refs, the bundle contains
+    only the commits missing from the remotes (small, incremental) — restoring
+    clones from the url first, then fetches the bundle on top. Otherwise the
+    bundle is fully self-contained (--all) and restorable with no remote at all
+    (covers repos whose configured remote does not actually exist).
+
+    Returns True if the bundle is self-contained, False if incremental.
+    """
+    repo = git.Repo(repo_path)
+    has_remote_refs = bool(repo.git.for_each_ref('refs/remotes'))
+    self_contained = url is None or not has_remote_refs
+    if self_contained:
+        # HEAD + --all only: also naming the branch would duplicate its ref
+        # in the bundle, which 'git clone <bundle>' rejects
+        args = ['HEAD', '--all']
+    else:
+        args = ['HEAD']
+        try:
+            args.append(repo.active_branch.name)
+        except TypeError:
+            pass  # detached HEAD
+        args += ['--not', '--remotes']
+    repo.git.bundle('create', bundle_file, *args)
+    return self_contained
+
+
 def export_workspace_state(workspace_path, output_dir=None, workspace_name=None, ignore_packages=None,
                            include_paths=None, extra_files=None, zip_suffix='.workspace.zip'):
     """
@@ -499,9 +532,36 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
     if not os.path.exists(source_folder):
         source_folder = workspace_path
 
+    # Bundle repos that no remote can restore (unpushed HEAD, no remote, or a
+    # configured remote that does not actually exist) so the zip stays
+    # self-sufficient. Incremental bundles carry only the unpushed commits.
+    bundle_tmp = tempfile.mkdtemp(prefix='rvcs_bundles_')
+    bundles = {}       # rel -> {'file': arcname, 'self_contained': bool}
+    bundle_paths = {}  # rel -> tmp file on disk
+    for root in find_git_repos(source_folder, ignore_packages):
+        rel = os.path.relpath(root, source_folder)
+        if not repo_in_include_paths(rel, include_paths):
+            continue
+        try:
+            repo = git.Repo(root)
+            url = list(repo.remotes.origin.urls)[0] if 'origin' in repo.remotes else None
+            head = repo.head.commit.hexsha
+            on_remote = repo.git.branch('-r', '--contains', head) if repo.remotes else ''
+            if url and on_remote.strip():
+                continue  # restorable from its remote, no bundle needed
+            bundle_file = os.path.join(bundle_tmp, rel.replace(os.sep, '__') + '.bundle')
+            self_contained = create_repo_bundle(root, bundle_file, url)
+            bundles[rel] = {'file': f'bundles/{rel}.bundle', 'self_contained': self_contained}
+            bundle_paths[rel] = bundle_file
+            kind = 'full history' if self_contained else 'unpushed commits only'
+            print(f"  Bundled {rel} ({kind}): HEAD {head[:7]} not restorable from a remote")
+        except Exception as e:
+            print(f"Warning: could not bundle {rel}: {e}")
+
     # Get vcstool repos content
     repos_content = export_vcs_repos(workspace_path, exact=True, ignore_packages=ignore_packages,
-                                     include_paths=include_paths)
+                                     include_paths=include_paths,
+                                     suppress_unpushed_warnings=set(bundles))
 
     # Collect diffs for dirty repos
     state_data = {
@@ -509,6 +569,8 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
         'export_date': date_str,
         'dirty_repos': {}
     }
+    if bundles:
+        state_data['bundles'] = bundles
 
     # Find all git repos and check for dirty state (same discovery + ignore
     # semantics as the manifest, so both sides of the export always agree)
@@ -538,6 +600,10 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
         state_content = yaml.dump(state_data, default_flow_style=False, allow_unicode=True)
         zf.writestr('workspace.state.yaml', state_content)
 
+        # Git bundles for repos not restorable from a remote
+        for rel, bundle_file in bundle_paths.items():
+            zf.write(bundle_file, bundles[rel]['file'])
+
         # Additional entries (pipeline definition, tmuxinator configs, raw extras)
         for arcname, source in (extra_files or {}).items():
             if isinstance(source, bytes):
@@ -545,10 +611,14 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             else:
                 zf.write(source, arcname)
 
+    shutil.rmtree(bundle_tmp, ignore_errors=True)
+
     dirty_count = len(state_data['dirty_repos'])
     print(f"\nExported to: {zip_file}")
     print(f"  Repositories: {repos_content.count('type:')}")
     print(f"  With uncommitted changes: {dirty_count}")
+    if bundles:
+        print(f"  Bundled (not on any remote): {len(bundles)}")
 
     return zip_file
 
@@ -648,6 +718,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     repos_content = None
     state_data = None
     pipeline_members = []
+    bundle_files = {}   # rel -> extracted .bundle path on disk
+    bundle_tmp = None
 
     # Handle zip file input
     if input_file.endswith('.zip'):
@@ -657,6 +729,15 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
             if 'workspace.state.yaml' in zf.namelist():
                 state_content = zf.read('workspace.state.yaml').decode('utf-8')
                 state_data = yaml.safe_load(state_content)
+            # Extract git bundles for repos that no remote can restore
+            for rel, meta in ((state_data or {}).get('bundles') or {}).items():
+                if meta.get('file') in zf.namelist():
+                    if bundle_tmp is None:
+                        bundle_tmp = tempfile.mkdtemp(prefix='rvcs_bundles_')
+                    dest = os.path.join(bundle_tmp, rel.replace('/', '__') + '.bundle')
+                    with open(dest, 'wb') as out:
+                        out.write(zf.read(meta['file']))
+                    bundle_files[rel] = dest
             pipeline_members = [n for n in zf.namelist()
                                 if n == 'pipeline.yaml'
                                 or n.startswith('tmuxinator/')
@@ -700,6 +781,68 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
             with open(state_file, 'r') as f:
                 state_data = yaml.safe_load(f)
 
+    results = {
+        'import_return_code': None,
+        'patched': [],
+        'patch_failed': [],
+        'bundled': [],
+        'bundle_failed': []
+    }
+
+    # Bundled repos are restored manually (vcstool cannot checkout a hash that
+    # exists on no remote), so strip them from the manifest handed to vcstool.
+    bundle_meta = (state_data or {}).get('bundles') or {}
+    bundled_entries = {}
+    manifest_repos = {}
+    if bundle_files:
+        manifest = yaml.safe_load(repos_content) or {}
+        manifest_repos = manifest.get('repositories') or {}
+        for rel in bundle_files:
+            if rel in manifest_repos:
+                bundled_entries[rel] = manifest_repos.pop(rel)
+        repos_content = yaml.dump({'repositories': manifest_repos}, default_flow_style=False)
+
+    def _restore_bundled_repo(rel):
+        meta = bundle_meta.get(rel, {})
+        entry = bundled_entries.get(rel, {})
+        url = entry.get('url')
+        version = entry.get('version')
+        dest = os.path.join(src_dir, rel)
+        try:
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if meta.get('self_contained'):
+                repo = git.Repo.clone_from(bundle_files[rel], dest)
+                # origin now points at the temporary bundle file — fix it up
+                if url:
+                    repo.git.remote('set-url', 'origin', url)
+                else:
+                    repo.git.remote('remove', 'origin')
+            else:
+                # incremental bundle: base history comes from the remote
+                repo = git.Repo.clone_from(url, dest)
+                repo.git.fetch(bundle_files[rel], 'HEAD')
+            if version:
+                repo.git.checkout(version)
+            kind = 'bundle' if meta.get('self_contained') else 'remote + bundle'
+            print(f"  Restored {rel} from {kind}")
+            results['bundled'].append(rel)
+        except Exception as e:
+            print(f"  Failed to restore bundled {rel}: {e}")
+            results['bundle_failed'].append(rel)
+
+    # Bundled repos that CONTAIN a manifest repo must exist before vcstool
+    # clones into them (parent-first); all other bundled repos come after, so
+    # a bundled repo nested inside a manifest repo finds its parent in place.
+    early = sorted(rel for rel in bundle_files
+                   if any(r.startswith(rel + '/') for r in manifest_repos))
+    late = sorted(set(bundle_files) - set(early))
+    if early:
+        print("\nRestoring bundled repos (parents of manifest repos)...")
+        for rel in early:
+            _restore_bundled_repo(rel)
+
     # Use vcstool import with temporary file (redirect stdout as vcstool ignores the stdout parameter)
     stdout_capture = StringIO()
 
@@ -719,12 +862,12 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
 
     import_output = stdout_capture.getvalue()
     print(import_output)
+    results['import_return_code'] = rc
 
-    results = {
-        'import_return_code': rc,
-        'patched': [],
-        'patch_failed': []
-    }
+    if late:
+        print("Restoring bundled repos...")
+        for rel in late:
+            _restore_bundled_repo(rel)
 
     # Apply diffs if state data available
     if state_data and state_data.get('dirty_repos'):
@@ -797,9 +940,16 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                 print(f"  Failed to apply changes to {rel_path}: {e}")
                 results['patch_failed'].append(rel_path)
 
+    if bundle_tmp:
+        shutil.rmtree(bundle_tmp, ignore_errors=True)
+
     print("\n" + "=" * 60)
     print(f"Import summary:")
     print(f"  vcstool import return code: {rc}")
+    if bundle_files:
+        print(f"  Bundled repos restored: {len(results['bundled'])}")
+        if results['bundle_failed']:
+            print(f"  Bundled repos FAILED: {len(results['bundle_failed'])} ({', '.join(results['bundle_failed'])})")
     if state_data:
         print(f"  Patches applied: {len(results['patched'])}")
         print(f"  Patches failed: {len(results['patch_failed'])}")
