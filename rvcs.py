@@ -426,15 +426,19 @@ def get_repo_diff(repo_path):
             'untracked_files': {}
         }
 
-        # Get staged changes (ensure trailing newline for git apply)
-        staged_diff = repo.git.diff('--cached')
+        # Get staged changes (ensure trailing newline for git apply).
+        # --binary: without it, binary-file changes come out as non-applyable
+        # "Binary files differ" stubs and git apply rejects the whole patch on
+        # import (hit in the wild: upstream elevation_mapping has committed
+        # build/ artifacts, deleted locally). Base64 transport keeps it safe.
+        staged_diff = repo.git.diff('--binary', '--cached')
         if staged_diff:
             if not staged_diff.endswith('\n'):
                 staged_diff += '\n'
             result['staged_diff'] = staged_diff
 
         # Get unstaged changes (ensure trailing newline for git apply)
-        unstaged_diff = repo.git.diff()
+        unstaged_diff = repo.git.diff('--binary')
         if unstaged_diff:
             if not unstaged_diff.endswith('\n'):
                 unstaged_diff += '\n'
