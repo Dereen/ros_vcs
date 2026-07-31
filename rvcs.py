@@ -587,6 +587,10 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             state_data['dirty_repos'][rel_path] = diff_data
             print(f"  Captured changes for: {rel_path}")
 
+    # Check for .colcon/config.yaml
+    colcon_config_path = os.path.join(workspace_path, '.colcon', 'config.yaml')
+    has_colcon_config = os.path.exists(colcon_config_path)
+
     # Create zip file
     zip_file = os.path.join(output_dir, f"{ws_name}_{date_str}{zip_suffix}")
     with zipfile.ZipFile(zip_file, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -615,6 +619,11 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             else:
                 zf.write(source, arcname)
 
+        # Add .colcon/config.yaml if it exists
+        if has_colcon_config:
+            zf.write(colcon_config_path, '.colcon/config.yaml')
+            print(f"  Included .colcon/config.yaml")
+
     shutil.rmtree(bundle_tmp, ignore_errors=True)
 
     dirty_count = len(state_data['dirty_repos'])
@@ -623,6 +632,7 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
     print(f"  With uncommitted changes: {dirty_count}")
     if bundles:
         print(f"  Bundled (not on any remote): {len(bundles)}")
+    print(f"  Colcon config: {'included' if has_colcon_config else 'not found'}")
 
     return zip_file
 
@@ -725,6 +735,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     bundle_files = {}   # rel -> extracted .bundle path on disk
     bundle_tmp = None
 
+    colcon_config_content = None
+
     # Handle zip file input
     if input_file.endswith('.zip'):
         print(f"Extracting workspace from {input_file}...")
@@ -733,6 +745,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
             if 'workspace.state.yaml' in zf.namelist():
                 state_content = zf.read('workspace.state.yaml').decode('utf-8')
                 state_data = yaml.safe_load(state_content)
+            if '.colcon/config.yaml' in zf.namelist():
+                colcon_config_content = zf.read('.colcon/config.yaml')
             # Extract git bundles for repos that no remote can restore
             for rel, meta in ((state_data or {}).get('bundles') or {}).items():
                 if meta.get('file') in zf.namelist():
@@ -790,7 +804,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         'patched': [],
         'patch_failed': [],
         'bundled': [],
-        'bundle_failed': []
+        'bundle_failed': [],
+        'colcon_config_restored': False,
     }
 
     # Bundled repos are restored manually (vcstool cannot checkout a hash that
@@ -872,6 +887,16 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         print("Restoring bundled repos...")
         for rel in late:
             _restore_bundled_repo(rel)
+
+    # Restore .colcon/config.yaml if it was included
+    if colcon_config_content:
+        colcon_dir = os.path.join(output_dir, '.colcon')
+        os.makedirs(colcon_dir, exist_ok=True)
+        colcon_config_path = os.path.join(colcon_dir, 'config.yaml')
+        with open(colcon_config_path, 'wb') as f:
+            f.write(colcon_config_content)
+        print(f"Restored .colcon/config.yaml")
+        results['colcon_config_restored'] = True
 
     # Apply diffs if state data available
     if state_data and state_data.get('dirty_repos'):
@@ -957,6 +982,9 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     if state_data:
         print(f"  Patches applied: {len(results['patched'])}")
         print(f"  Patches failed: {len(results['patch_failed'])}")
+    if results['colcon_config_restored']:
+        print(f"  Colcon config: restored")
+
 
     return results
 
