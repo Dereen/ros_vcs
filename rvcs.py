@@ -49,6 +49,7 @@ CLI usage:
 import argparse
 import base64
 import os
+import re
 import shutil
 import sys
 import json
@@ -567,9 +568,13 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
                                      include_paths=include_paths,
                                      suppress_unpushed_warnings=set(bundles))
 
-    # Collect diffs for dirty repos
+    # Collect diffs for dirty repos.
+    # workspace_root records where this workspace lived at export time; import
+    # rewrites that prefix out of the pipeline payload (tmuxinator configs and
+    # pipeline.yaml routinely hardcode it) when restoring somewhere else.
     state_data = {
         'workspace_name': ws_name,
+        'workspace_root': os.path.abspath(workspace_path),
         'export_date': date_str,
         'dirty_repos': {}
     }
@@ -706,7 +711,174 @@ def export_pipeline_state(pipeline_file, workspace_path=None, output_dir=None):
     )
 
 
-def import_workspace_state(input_file, output_dir, state_file=None, install_tmuxinator=False):
+# Absolute paths worth reasoning about. Deliberately not every possible root:
+# these are the ones that carry a machine/user identity and therefore break when
+# a workspace moves. Trailing punctuation is stripped by _clean_path_match.
+_ABS_PATH_RE = re.compile(
+    r'(?<![\w.-])(/(?:home|Users|root|mnt|media|srv|data|opt)(?:/[^\s\'"`,;:()\[\]{}<>|*?]+)*)'
+)
+
+# YAML keys that name the workspace root structurally rather than as part of a
+# longer command string (tmuxinator's `root:`, rvcs's own `workspace:`).
+_ROOT_KEY_RE = re.compile(r'^(\s*(?:root|workspace):\s*)(["\']?)([^"\'#\n]+?)(\2\s*(?:#.*)?)$',
+                          re.MULTILINE)
+
+
+def _clean_path_match(p):
+    """Strip trailing punctuation a regex inevitably swallows off a path."""
+    return p.rstrip('.,;:\'"`)]}')
+
+
+def _tilde_forms(path):
+    """
+    Both spellings of an absolute home path: '/home/bob/ws' and '~/ws'.
+
+    A config written on another machine may use either, and only the absolute
+    form carries the foreign username, so both have to be rewritten.
+    """
+    forms = {path}
+    m = re.match(r'^(/(?:home|Users)/[^/]+|/root)(/.*)?$', path)
+    if m:
+        forms.add('~' + (m.group(2) or ''))
+    return forms
+
+
+def infer_export_root(texts, declared_root=None):
+    """
+    Best-effort recovery of the export-time workspace root for zips written
+    before workspace_root was recorded (rvcs <= 1.1.0).
+
+    Looks for absolute paths under a home directory that is not this user's,
+    and keeps the prefix ending at the workspace directory component — taken
+    from declared_root's basename when available, e.g. a config full of
+    /home/cnuc/marv_ws/... with `root: ~/marv_ws` yields /home/cnuc/marv_ws.
+
+    Returns the inferred root, or None when there is nothing to go on.
+    """
+    home = os.path.expanduser('~')
+    basename = os.path.basename((declared_root or '').rstrip('/')) or None
+    counts = {}
+    for text in texts:
+        for raw in _ABS_PATH_RE.findall(text):
+            path = _clean_path_match(raw)
+            if path == home or path.startswith(home + os.sep):
+                continue
+            if not re.match(r'^/(?:home|Users)/[^/]+/', path):
+                continue
+            parts = path.split('/')
+            if basename:
+                if basename not in parts:
+                    continue
+                cut = parts.index(basename) + 1
+            else:
+                cut = 4  # /home/<user>/<dir>
+                if len(parts) < cut:
+                    continue
+            candidate = '/'.join(parts[:cut])
+            counts[candidate] = counts.get(candidate, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
+
+
+def rewrite_workspace_paths(text, old_root, new_root):
+    """
+    Point a restored pipeline payload at the workspace it was actually imported
+    into: substitute old_root (in both its absolute and ~ spellings) with
+    new_root, then fix up any `root:`/`workspace:` key the substitution missed
+    (the config may declare a root that never appears in the commands).
+
+    Only ever applied to files rvcs itself authored into the zip — tmuxinator
+    configs and pipeline.yaml. Never to repository working trees: those are
+    tracked git content, and rewriting them would surface as phantom diffs.
+
+    Returns (new_text, substitution_count).
+    """
+    count = 0
+    for form in sorted(_tilde_forms(old_root), key=len, reverse=True):
+        if form and form != new_root and form in text:
+            count += text.count(form)
+            text = text.replace(form, new_root)
+
+    def _fix_key(m):
+        nonlocal count
+        value = m.group(3).strip()
+        if os.path.expanduser(value).rstrip('/') == new_root.rstrip('/'):
+            return m.group(0)
+        count += 1
+        return f"{m.group(1)}{m.group(2)}{new_root}{m.group(4)}"
+
+    return _ROOT_KEY_RE.sub(_fix_key, text), count
+
+
+def check_restored_paths(workspace_path, max_examples=3):
+    """
+    Post-import doctor: find absolute paths in the restored workspace that do
+    not exist on this machine.
+
+    Catches what rewriting deliberately cannot — paths hardcoded inside the
+    repositories themselves (launch files, shell scripts). Those belong to the
+    repos and must be fixed upstream, so this only reports them.
+
+    Returns {missing_prefix: {'count': int, 'files': [rel_path, ...]}}.
+    """
+    # .github holds CI templates full of paths for other machines/distros — pure
+    # noise here, and never what a broken session is tripping over.
+    skip_dirs = {'.git', '.github', 'build', 'install', 'log', '__pycache__',
+                 '.venv', 'node_modules'}
+    text_ext = {'.py', '.sh', '.bash', '.yaml', '.yml', '.launch', '.xml', '.json',
+                '.cfg', '.ini', '.txt', '.md', '.rviz', '.repos', ''}
+    home = os.path.expanduser('~')
+    findings = {}
+
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fn in files:
+            if os.path.splitext(fn)[1].lower() not in text_ext:
+                continue
+            full = os.path.join(root, fn)
+            try:
+                if os.path.getsize(full) > 2 * 1024 * 1024:
+                    continue
+                with open(full, 'r', encoding='utf-8', errors='strict') as f:
+                    content = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            rel = os.path.relpath(full, workspace_path)
+            for raw in set(_ABS_PATH_RE.findall(content)):
+                path = _clean_path_match(raw)
+                if os.path.exists(path):
+                    continue
+                # group by the identity-carrying prefix: /home/<user>, /opt/<x>
+                parts = path.split('/')
+                prefix = '/'.join(parts[:3]) if len(parts) > 3 else path
+                if prefix == home or path.startswith(home + os.sep):
+                    continue
+                entry = findings.setdefault(prefix, {'count': 0, 'files': []})
+                entry['count'] += 1
+                if rel not in entry['files']:
+                    entry['files'].append(rel)
+    return findings
+
+
+def report_restored_paths(findings, max_examples=3):
+    """Print the doctor's findings as an actionable block."""
+    if not findings:
+        return
+    total = sum(v['count'] for v in findings.values())
+    print(f"\nWarning: {total} reference(s) to paths that do not exist on this machine:")
+    for prefix, info in sorted(findings.items(), key=lambda kv: -kv[1]['count']):
+        print(f"  {prefix}* — {info['count']} reference(s) in {len(info['files'])} file(s)")
+        for rel in info['files'][:max_examples]:
+            print(f"      {rel}")
+        if len(info['files']) > max_examples:
+            print(f"      ... and {len(info['files']) - max_examples} more")
+    print("  These live inside the restored repositories; rvcs does not rewrite")
+    print("  tracked files. Fix them upstream or adjust them by hand.")
+
+
+def import_workspace_state(input_file, output_dir, state_file=None, install_tmuxinator=False,
+                           rewrite_paths=True):
     """
     Import workspace state using vcstool and optionally apply diffs.
 
@@ -721,6 +893,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         output_dir: Directory where repositories will be cloned
         state_file: Optional path to .state.yaml file with diffs (ignored if zip provided)
         install_tmuxinator: Also copy bundled tmuxinator configs to ~/.config/tmuxinator
+        rewrite_paths: Rewrite the export-time workspace root out of the pipeline
+            payload (tmuxinator configs, pipeline.yaml) so it points at output_dir
 
     Returns:
         Dictionary with 'import_return_code', 'patched', 'patch_failed'
@@ -736,6 +910,7 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     bundle_tmp = None
 
     colcon_config_content = None
+    results_paths_rewritten = []   # (member, substitutions), merged into results below
 
     # Handle zip file input
     if input_file.endswith('.zip'):
@@ -761,6 +936,46 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                                 or n.startswith('tmuxinator/')
                                 or n.startswith('extra/')]
             if pipeline_members:
+                # Files rvcs authored itself — the only ones it may rewrite.
+                # extra/* is verbatim user content and repos are tracked git
+                # trees, so both are restored byte-for-byte regardless.
+                rewritable = [n for n in pipeline_members
+                              if n == 'pipeline.yaml' or n.startswith('tmuxinator/')]
+
+                export_root = (state_data or {}).get('workspace_root')
+                if rewrite_paths and not export_root and rewritable:
+                    # Pre-workspace_root zip: recover the old root from the
+                    # payload itself, anchored on whatever root it declares.
+                    texts = []
+                    declared = None
+                    for n in rewritable:
+                        try:
+                            t = zf.read(n).decode('utf-8')
+                        except UnicodeDecodeError:
+                            continue
+                        texts.append(t)
+                        m = _ROOT_KEY_RE.search(t)
+                        if m and not declared:
+                            declared = m.group(3).strip()
+                    export_root = infer_export_root(texts, declared)
+                    if export_root:
+                        print(f"  Inferred export-time workspace root: {export_root}")
+
+                target_root = os.path.abspath(output_dir)
+                rewritten = {}   # member -> rewritten bytes
+                if rewrite_paths and export_root:
+                    for n in rewritable:
+                        try:
+                            text = zf.read(n).decode('utf-8')
+                        except UnicodeDecodeError:
+                            continue
+                        new_text, subs = rewrite_workspace_paths(text, export_root, target_root)
+                        if subs:
+                            rewritten[n] = new_text.encode('utf-8')
+                            results_paths_rewritten.append((n, subs))
+                            print(f"  Rewrote {subs} path(s) in {n}: "
+                                  f"{export_root} -> {target_root}")
+
                 # Restore pipeline payload into the new workspace. extra/<rel>
                 # entries land at their workspace-relative path; tmuxinator
                 # configs land in <output_dir>/tmuxinator/ so nothing outside
@@ -774,7 +989,7 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                         dest = os.path.join(output_dir, member)
                     os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
                     with open(dest, 'wb') as out:
-                        out.write(zf.read(member))
+                        out.write(rewritten.get(member) or zf.read(member))
                 tmux_files = [n for n in pipeline_members if n.startswith('tmuxinator/')]
                 if tmux_files:
                     print(f"  Restored tmuxinator configs to {os.path.join(output_dir, 'tmuxinator')}/")
@@ -783,8 +998,10 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                         os.makedirs(tmux_config_dir, exist_ok=True)
                         for n in tmux_files:
                             dest = os.path.join(tmux_config_dir, os.path.basename(n))
+                            # install the rewritten copy, not the raw one, or
+                            # ~/.config would get the broken paths back
                             with open(dest, 'wb') as out:
-                                out.write(zf.read(n))
+                                out.write(rewritten.get(n) or zf.read(n))
                             print(f"  Installed {dest}")
                     else:
                         print(f"  (use --install-tmuxinator to copy them into ~/.config/tmuxinator)")
@@ -806,6 +1023,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         'bundled': [],
         'bundle_failed': [],
         'colcon_config_restored': False,
+        'paths_rewritten': results_paths_rewritten,
+        'path_warnings': {}
     }
 
     # Bundled repos are restored manually (vcstool cannot checkout a hash that
@@ -984,7 +1203,13 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         print(f"  Patches failed: {len(results['patch_failed'])}")
     if results['colcon_config_restored']:
         print(f"  Colcon config: restored")
+    if results['paths_rewritten']:
+        total = sum(n for _, n in results['paths_rewritten'])
+        print(f"  Paths rewritten: {total} in {len(results['paths_rewritten'])} file(s)")
 
+    # Doctor: what rewriting could not reach (hardcoded paths inside the repos)
+    results['path_warnings'] = check_restored_paths(output_dir)
+    report_restored_paths(results['path_warnings'])
 
     return results
 
@@ -1020,6 +1245,9 @@ Examples:
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
                         help='With --import-state: copy bundled tmuxinator configs into ~/.config/tmuxinator')
+    parser.add_argument('--no-path-rewrite', action='store_true',
+                        help='With --import-state: restore the pipeline payload verbatim instead of '
+                             'repointing the export-time workspace root at the import directory')
     parser.add_argument('--ignore', help='Ignore file with package names to exclude (status AND --export-state)')
     parser.add_argument('--name', help='Workspace name for --export-state output file (default: workspace dir name)')
     parser.add_argument('workspace', nargs='?', default=None, help='Workspace folder or output dir')
@@ -1075,7 +1303,8 @@ Examples:
             print(f"Error: Output directory '{output_dir}' exists and is not empty")
             exit(1)
         import_workspace_state(args.import_state, output_dir, args.state_file,
-                               install_tmuxinator=args.install_tmuxinator)
+                               install_tmuxinator=args.install_tmuxinator,
+                               rewrite_paths=not args.no_path_rewrite)
         exit(0)
 
     if args.compare and args.json:

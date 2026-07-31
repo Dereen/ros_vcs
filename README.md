@@ -127,6 +127,37 @@ workspace-relative locations:
 ./rvcs.py --import-state overhang_rejection_2026-07-29.pipeline.zip ~/new_ws --install-tmuxinator
 ```
 
+#### Path portability
+
+Tmuxinator configs and pipeline definitions routinely hardcode the workspace
+they were written for (`root: ~/marv_ws`, `bash /home/alice/marv_ws/sim/run.sh`).
+Restoring those verbatim on another machine — or into a different directory —
+breaks every window.
+
+Exports record the workspace root in `workspace.state.yaml`, and import rewrites
+it to wherever you actually imported, reporting each substitution:
+
+```
+Rewrote 10 path(s) in tmuxinator/marv_flipper_eval.yml: /home/alice/marv_ws -> /home/bob/workspaces/marv_ws
+```
+
+Zips written before this existed have no recorded root; import infers it from
+the payload instead (`Inferred export-time workspace root: ...`). Use
+`--no-path-rewrite` to restore the payload byte-for-byte.
+
+Only files rvcs itself wrote into the zip are rewritten — `pipeline.yaml` and
+`tmuxinator/*`. Repository working trees and `extra_paths` content are never
+touched: they are tracked git content, and rewriting them would show up as
+phantom diffs. Paths hardcoded *inside* the repos are reported after import
+instead, so you can fix them upstream:
+
+```
+Warning: 62 reference(s) to paths that do not exist on this machine:
+  /home/alice* — 62 reference(s) in 29 file(s)
+      src/marv_flipper_control_research/marv_flipper_eval/launch/policy.launch.py
+      ...
+```
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:
@@ -161,6 +192,7 @@ Color codes:
 | `--import-state FILE` | Import from .workspace.zip, .pipeline.zip or .repos file |
 | `--state-file FILE` | State file with diffs (use with --import-state) |
 | `--install-tmuxinator` | With --import-state: copy bundled tmuxinator configs to ~/.config/tmuxinator |
+| `--no-path-rewrite` | With --import-state: restore the pipeline payload verbatim (skip root rewriting) |
 | `-c, --compare FILE` | Compare with JSON snapshot |
 | `-j, --json` | Export to JSON file |
 | `--ignore FILE` | File with package names to exclude |
