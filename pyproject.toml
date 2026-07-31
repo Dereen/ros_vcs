@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ros-vcs"
-version = "1.0.0"
+# single source of truth: rvcs.__version__ (read via AST, no import at build time)
+dynamic = ["version"]
 description = "RVCS - ROS VCS Workspace Manager: manage ROS/catkin workspaces with git repositories"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -20,3 +21,6 @@ rvcs = "rvcs:main"
 
 [tool.setuptools]
 py-modules = ["rvcs"]
+
+[tool.setuptools.dynamic]
+version = {attr = "rvcs.__version__"}
