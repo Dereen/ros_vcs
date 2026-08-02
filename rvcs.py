@@ -67,7 +67,7 @@ import git
 from vcstool.commands.export import main as vcs_export
 from vcstool.commands.import_ import main as vcs_import
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Module-level debug flag (set by CLI)
 _debug = False
