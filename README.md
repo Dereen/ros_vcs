@@ -193,6 +193,45 @@ the machine outside the target directory. rosdep must have been initialised
 than failing obscurely. No ROS overlay needs to be sourced — the distro is taken
 from `$ROS_DISTRO`, falling back to what is installed under `/opt/ros`.
 
+#### Building
+
+`--build` runs `colcon build --symlink-install` once everything is restored and
+dependencies are in place, so one command takes a zip to a built workspace:
+
+```bash
+./rvcs.py --import-state ws.pipeline.zip ~/new_ws --install-deps --build
+```
+
+colcon resolves ament packages out of the environment, and rvcs runs from its
+own venv with no ROS overlay sourced — so the build goes through a shell that
+sources `/opt/ros/<distro>/setup.bash` first, with the distro taken from
+`$ROS_DISTRO` or `/opt/ros`.
+
+Extra colcon arguments go through `--build-args`, environment through
+`--build-env` (repeatable):
+
+```bash
+./rvcs.py --import-state ws.pipeline.zip ~/new_ws --build \
+    --build-args "--continue-on-error --cmake-args -DBUILD_TESTING=OFF" \
+    --build-env CMAKE_BUILD_PARALLEL_LEVEL=8
+```
+
+**CUDA**: toolkits install into `/usr/local/cuda*/bin`, which distros do not put
+on `PATH`, so a package with a CUDA target fails at configure time with
+`No CMAKE_CUDA_COMPILER could be found` even though nvcc is installed. rvcs
+detects this and prepends the directory, reporting what it did:
+
+```
+env: PATH += /usr/local/cuda/bin (nvcc found but not on PATH)
+```
+
+Target GPU architecture is not guessed — pass it yourself when a package
+hardcodes one that does not match the local card, e.g.
+`--build-args "--cmake-args -DCMAKE_CUDA_ARCHITECTURES=86"`.
+
+The build is opt-in: it is slow, and it writes `build/`, `install/` and `log/`
+into the target directory.
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:
@@ -228,6 +267,9 @@ Color codes:
 | `--state-file FILE` | State file with diffs (use with --import-state) |
 | `--install-tmuxinator` | With --import-state: copy bundled tmuxinator configs to ~/.config/tmuxinator |
 | `--install-deps` | With --import-state: run `rosdep install` for the restored workspace (needs sudo) |
+| `--build` | With --import-state: run `colcon build` on the restored workspace |
+| `--build-args ARGS` | Extra arguments for `--build`, e.g. `"--cmake-args -DBUILD_TESTING=OFF"` |
+| `--build-env KEY=VALUE` | Environment override for `--build` (repeatable) |
 | `--no-path-rewrite` | With --import-state: restore the pipeline payload verbatim (skip root rewriting) |
 | `-c, --compare FILE` | Compare with JSON snapshot |
 | `-j, --json` | Export to JSON file |

@@ -48,8 +48,10 @@ CLI usage:
 
 import argparse
 import base64
+import glob
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -67,7 +69,7 @@ import git
 from vcstool.commands.export import main as vcs_export
 from vcstool.commands.import_ import main as vcs_import
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Module-level debug flag (set by CLI)
 _debug = False
@@ -1016,8 +1018,97 @@ def install_system_deps(workspace_path, rosdistro=None):
     return True
 
 
+def _cuda_bin_dir():
+    """
+    Directory holding nvcc, when it exists but is not on PATH.
+
+    CUDA toolkits install under /usr/local/cuda*/bin, which the distro does not
+    add to PATH. A package with a CUDA target then dies at configure time with
+    "No CMAKE_CUDA_COMPILER could be found" even though the compiler is present.
+    Prefers the /usr/local/cuda symlink (points at the chosen toolkit), then the
+    highest-numbered versioned directory.
+    """
+    if shutil.which('nvcc'):
+        return None
+    canonical = '/usr/local/cuda/bin/nvcc'
+    if os.path.isfile(canonical):
+        return os.path.dirname(canonical)
+    for path in sorted(glob.glob('/usr/local/cuda-*/bin/nvcc'), reverse=True):
+        return os.path.dirname(path)
+    return None
+
+
+def build_environment(env_overrides=None):
+    """
+    Environment for the build subprocess.
+
+    Returns (env, notes); notes describe every adjustment so nothing happens
+    invisibly. env_overrides is a list of 'KEY=VALUE' strings, applied last so
+    the caller always wins over the automatic fixes.
+    """
+    env = os.environ.copy()
+    notes = []
+
+    cuda_bin = _cuda_bin_dir()
+    if cuda_bin:
+        env['PATH'] = cuda_bin + os.pathsep + env.get('PATH', '')
+        notes.append(f'PATH += {cuda_bin} (nvcc found but not on PATH)')
+
+    for item in env_overrides or []:
+        key, sep, value = item.partition('=')
+        if not sep or not key:
+            raise ValueError(f"--build-env expects KEY=VALUE, got {item!r}")
+        env[key] = value
+        notes.append(f'{key}={value}')
+    return env, notes
+
+
+def build_workspace(workspace_path, rosdistro=None, build_args=None, env_overrides=None):
+    """
+    Build the restored workspace with colcon.
+
+    colcon resolves ament packages out of the environment, and rvcs runs from
+    its own venv with no ROS overlay sourced -- so the build goes through a
+    shell that sources /opt/ros/<distro>/setup.bash first. Output is left
+    uncaptured: a build is long, and its progress is the point.
+
+    Returns colcon's exit code, or None if it could not be started.
+    """
+    if shutil.which('colcon') is None:
+        print("Cannot build: colcon is not installed")
+        return None
+    rosdistro = rosdistro or detect_rosdistro()
+    setup = f'/opt/ros/{rosdistro}/setup.bash' if rosdistro else None
+    if not setup or not os.path.isfile(setup):
+        print(f"Cannot build: no ROS setup.bash for distro {rosdistro!r}")
+        return None
+
+    argv = ['colcon', 'build', '--symlink-install']
+    if build_args:
+        argv += build_args if isinstance(build_args, list) else shlex.split(build_args)
+    try:
+        env, notes = build_environment(env_overrides)
+    except ValueError as e:
+        print(f"Cannot build: {e}")
+        return None
+    command = f'. {shlex.quote(setup)} && exec {shlex.join(argv)}'
+    print(f"\nBuilding workspace in {workspace_path}:\n  {shlex.join(argv)}")
+    for note in notes:
+        print(f"  env: {note}")
+    try:
+        proc = subprocess.run(['bash', '-c', command], cwd=workspace_path, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  colcon build failed to start: {e}")
+        return None
+    if proc.returncode != 0:
+        print(f"  colcon build exited with code {proc.returncode} "
+              f"(see {os.path.join(workspace_path, 'log', 'latest_build')})")
+    return proc.returncode
+
+
 def import_workspace_state(input_file, output_dir, state_file=None, install_tmuxinator=False,
-                           rewrite_paths=True, install_deps=False):
+                           rewrite_paths=True, install_deps=False, build=False,
+                           build_args=None, build_env=None):
     """
     Import workspace state using vcstool and optionally apply diffs.
 
@@ -1036,6 +1127,11 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
             payload (tmuxinator configs, pipeline.yaml) so it points at output_dir
         install_deps: Run `rosdep install` for the restored workspace afterwards.
             Requires sudo, so it is opt-in; the check itself always runs.
+        build: Run `colcon build` once everything is restored and dependencies
+            are in place (opt-in -- a build is slow and writes build/install/log)
+        build_args: Extra arguments appended to the colcon build command
+            (string or list), e.g. '--cmake-args -DBUILD_TESTING=OFF'
+        build_env: List of 'KEY=VALUE' overrides for the build environment
 
     Returns:
         Dictionary with 'import_return_code', 'patched', 'patch_failed'
@@ -1360,6 +1456,15 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     report_system_deps(deps)
     results['system_deps'] = deps
 
+    # Build last: everything the build needs is now in place, and unmet system
+    # deps are already on screen so a failure here is attributable.
+    if build:
+        if deps.get('ok') and deps.get('missing'):
+            print("\nNote: building with unmet system dependencies "
+                  "(see the warning above) -- expect failures")
+        results['build_return_code'] = build_workspace(
+            output_dir, deps.get('rosdistro'), build_args, build_env)
+
     return results
 
 
@@ -1394,6 +1499,14 @@ Examples:
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
                         help='With --import-state: copy bundled tmuxinator configs into ~/.config/tmuxinator')
+    parser.add_argument('--build', action='store_true',
+                        help='With --import-state: run colcon build on the restored workspace')
+    parser.add_argument('--build-args',
+                        help='Extra arguments for --build, e.g. '
+                             '"--cmake-args -DBUILD_TESTING=OFF"')
+    parser.add_argument('--build-env', action='append', metavar='KEY=VALUE',
+                        help='Environment override for --build (repeatable). nvcc is '
+                             'added to PATH automatically when installed but not listed')
     parser.add_argument('--install-deps', action='store_true',
                         help='With --import-state: run rosdep install for the restored '
                              'workspace (needs sudo). Missing deps are reported either way')
@@ -1457,7 +1570,9 @@ Examples:
         import_workspace_state(args.import_state, output_dir, args.state_file,
                                install_tmuxinator=args.install_tmuxinator,
                                rewrite_paths=not args.no_path_rewrite,
-                               install_deps=args.install_deps)
+                               install_deps=args.install_deps,
+                               build=args.build, build_args=args.build_args,
+                               build_env=args.build_env)
         exit(0)
 
     if args.compare and args.json:
