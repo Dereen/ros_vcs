@@ -69,7 +69,13 @@ import git
 from vcstool.commands.export import main as vcs_export
 from vcstool.commands.import_ import main as vcs_import
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
+
+# Workspace-level colcon configuration, captured on export and restored on
+# import. colcon reads colcon_defaults.yaml from the directory it runs in, so
+# restoring it is what lets a workspace pin its own build settings instead of
+# every importer passing them by hand.
+COLCON_CONFIG_FILES = ('colcon_defaults.yaml', '.colcon/config.yaml')
 
 # Module-level debug flag (set by CLI)
 _debug = False
@@ -595,9 +601,15 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             state_data['dirty_repos'][rel_path] = diff_data
             print(f"  Captured changes for: {rel_path}")
 
-    # Check for .colcon/config.yaml
-    colcon_config_path = os.path.join(workspace_path, '.colcon', 'config.yaml')
-    has_colcon_config = os.path.exists(colcon_config_path)
+    # Workspace-level colcon configuration. Both files live outside every repo,
+    # so nothing else in the export would carry them: colcon_defaults.yaml is
+    # read automatically from the directory colcon runs in, and .colcon/config.yaml
+    # when it is pointed at via COLCON_HOME/COLCON_DEFAULTS_FILE.
+    colcon_files = {}   # arcname -> absolute source path
+    for rel in COLCON_CONFIG_FILES:
+        full = os.path.join(workspace_path, rel)
+        if os.path.isfile(full):
+            colcon_files[rel] = full
 
     # Create zip file
     zip_file = os.path.join(output_dir, f"{ws_name}_{date_str}{zip_suffix}")
@@ -627,10 +639,10 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             else:
                 zf.write(source, arcname)
 
-        # Add .colcon/config.yaml if it exists
-        if has_colcon_config:
-            zf.write(colcon_config_path, '.colcon/config.yaml')
-            print(f"  Included .colcon/config.yaml")
+        # Workspace colcon configuration
+        for arcname, full in colcon_files.items():
+            zf.write(full, arcname)
+            print(f"  Included {arcname}")
 
     shutil.rmtree(bundle_tmp, ignore_errors=True)
 
@@ -640,7 +652,7 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
     print(f"  With uncommitted changes: {dirty_count}")
     if bundles:
         print(f"  Bundled (not on any remote): {len(bundles)}")
-    print(f"  Colcon config: {'included' if has_colcon_config else 'not found'}")
+    print(f"  Colcon config: {', '.join(colcon_files) if colcon_files else 'not found'}")
 
     return zip_file
 
@@ -1146,7 +1158,7 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     bundle_files = {}   # rel -> extracted .bundle path on disk
     bundle_tmp = None
 
-    colcon_config_content = None
+    colcon_config_content = {}   # arcname -> bytes
     results_paths_rewritten = []   # (member, substitutions), merged into results below
 
     # Handle zip file input
@@ -1157,8 +1169,9 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
             if 'workspace.state.yaml' in zf.namelist():
                 state_content = zf.read('workspace.state.yaml').decode('utf-8')
                 state_data = yaml.safe_load(state_content)
-            if '.colcon/config.yaml' in zf.namelist():
-                colcon_config_content = zf.read('.colcon/config.yaml')
+            for rel in COLCON_CONFIG_FILES:
+                if rel in zf.namelist():
+                    colcon_config_content[rel] = zf.read(rel)
             # Extract git bundles for repos that no remote can restore
             for rel, meta in ((state_data or {}).get('bundles') or {}).items():
                 if meta.get('file') in zf.namelist():
@@ -1344,14 +1357,15 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         for rel in late:
             _restore_bundled_repo(rel)
 
-    # Restore .colcon/config.yaml if it was included
-    if colcon_config_content:
-        colcon_dir = os.path.join(output_dir, '.colcon')
-        os.makedirs(colcon_dir, exist_ok=True)
-        colcon_config_path = os.path.join(colcon_dir, 'config.yaml')
-        with open(colcon_config_path, 'wb') as f:
-            f.write(colcon_config_content)
-        print(f"Restored .colcon/config.yaml")
+    # Restore the workspace colcon configuration. Written before the build so
+    # colcon_defaults.yaml is in place when colcon runs -- that is what makes
+    # --build need no --build-args for a workspace that pins its own settings.
+    for rel, content in colcon_config_content.items():
+        dest = os.path.join(output_dir, rel)
+        os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
+        with open(dest, 'wb') as f:
+            f.write(content)
+        print(f"Restored {rel}")
         results['colcon_config_restored'] = True
 
     # Apply diffs if state data available

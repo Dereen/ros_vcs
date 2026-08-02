@@ -12,6 +12,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Comparison Mode**: Compare local workspace against a remote snapshot
 - **vcstool Compatible**: Export format is compatible with standard `vcs import` command
 - **Pipelines**: Back up one *slice* of a shared workspace (the repos one line of research uses) together with its tmuxinator session configs
+- **Colcon config**: `colcon_defaults.yaml` / `.colcon/config.yaml` travel with the export, so a workspace pins its own build settings instead of every importer passing them by hand
 - **Git-bundle fallback**: Repos whose HEAD no remote can serve (unpushed commits, no remote, or a configured remote that doesn't exist) are embedded in the zip as git bundles, so exports are restorable without pushing first
 
 ## Installation
@@ -231,6 +232,27 @@ hardcodes one that does not match the local card, e.g.
 
 The build is opt-in: it is slow, and it writes `build/`, `install/` and `log/`
 into the target directory.
+
+**Workspace build settings belong in the workspace, not in the command.** colcon
+reads `colcon_defaults.yaml` from the directory it runs in, and exports carry
+that file (along with `.colcon/config.yaml`) — neither lives inside a repo, so
+nothing else in the zip would preserve them. A workspace that pins its own
+settings therefore needs no `--build-args` at all:
+
+```yaml
+# <workspace>/colcon_defaults.yaml
+build:
+  cmake-args:
+    - -DBUILD_TESTING=OFF
+```
+
+```bash
+rvcs --import-state ws.pipeline.zip ~/new_ws --install-deps --build   # no flags
+```
+
+Prefer this over `--build-args` for anything intrinsic to the workspace: it is
+recorded once, travels with every export, and cannot be forgotten on the next
+machine.
 
 ### Compare Workspaces
 
