@@ -158,6 +158,41 @@ Warning: 62 reference(s) to paths that do not exist on this machine:
       ...
 ```
 
+#### System dependencies
+
+A restored workspace is source only — it still needs whatever its packages
+declare in `package.xml`. Every import ends with a read-only `rosdep check`, so
+what stands between the import and a successful build is visible before you
+invoke colcon:
+
+```
+Warning: 7 system dependency(ies) not installed:
+  [apt] libgoogle-glog-dev ros-jazzy-grid-map-core ros-jazzy-grid-map-ros ...
+  Install with: rvcs --import-state ... --install-deps
+
+Warning: 5 rosdep key(s) could not be resolved:
+  elevation_mapping: pcl
+  marv_xu_hto: marv_flipper_baselines
+  These are unknown to rosdep -- typically a wrong key in the
+  package's package.xml, or a repo missing from the pipeline.
+```
+
+The second group is the easy one to miss: `rosdep install -r` prints those and
+carries on, so an unresolvable key looks like success until the build fails.
+
+`--install-deps` runs the install for you:
+
+```bash
+./rvcs.py --import-state ws.pipeline.zip ~/new_ws --install-deps
+```
+
+It is opt-in because rosdep shells out to `sudo -H apt-get` and will prompt for
+a password — a plain `--import-state` stays non-interactive and never changes
+the machine outside the target directory. rosdep must have been initialised
+(`rosdep init` + `rosdep update`); if its cache is empty, rvcs says so rather
+than failing obscurely. No ROS overlay needs to be sourced — the distro is taken
+from `$ROS_DISTRO`, falling back to what is installed under `/opt/ros`.
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:
@@ -192,6 +227,7 @@ Color codes:
 | `--import-state FILE` | Import from .workspace.zip, .pipeline.zip or .repos file |
 | `--state-file FILE` | State file with diffs (use with --import-state) |
 | `--install-tmuxinator` | With --import-state: copy bundled tmuxinator configs to ~/.config/tmuxinator |
+| `--install-deps` | With --import-state: run `rosdep install` for the restored workspace (needs sudo) |
 | `--no-path-rewrite` | With --import-state: restore the pipeline payload verbatim (skip root rewriting) |
 | `-c, --compare FILE` | Compare with JSON snapshot |
 | `-j, --json` | Export to JSON file |

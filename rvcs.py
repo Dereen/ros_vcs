@@ -51,6 +51,7 @@ import base64
 import os
 import re
 import shutil
+import subprocess
 import sys
 import json
 import yaml
@@ -877,8 +878,146 @@ def report_restored_paths(findings, max_examples=3):
     print("  tracked files. Fix them upstream or adjust them by hand.")
 
 
+_ROSDEP_UNRESOLVED_RE = re.compile(r'^ERROR\[(.+?)\]:\s*Cannot locate rosdep definition for \[(.+?)\]',
+                                   re.MULTILINE)
+# "apt\tros-jazzy-grid-map-core" under "System dependencies have not been satisfied:"
+_ROSDEP_MISSING_RE = re.compile(r'^(apt|pip|pip3|gem|source|npm)\s+(\S+)\s*$', re.MULTILINE)
+
+
+def detect_rosdistro():
+    """ROS distro for rosdep: the sourced one, else the newest under /opt/ros."""
+    distro = os.environ.get('ROS_DISTRO')
+    if distro:
+        return distro
+    try:
+        candidates = sorted(d for d in os.listdir('/opt/ros')
+                            if os.path.isdir(os.path.join('/opt/ros', d)))
+    except OSError:
+        return None
+    return candidates[-1] if candidates else None
+
+
+def _rosdep_source_folder(workspace_path):
+    src = os.path.join(workspace_path, 'src')
+    return src if os.path.isdir(src) else workspace_path
+
+
+def check_system_deps(workspace_path, rosdistro=None):
+    """
+    Ask rosdep what the restored workspace still needs from the system.
+
+    Read-only and sudo-free -- the counterpart to check_restored_paths: report
+    what stands between the import and a successful build, without changing the
+    machine. rosdep is a standalone tool, so no ROS overlay need be sourced;
+    --rosdistro carries what a sourced environment otherwise would.
+
+    Returns {'ok': bool, 'reason': str|None, 'missing': [(installer, pkg)],
+             'unresolved': {package: [rosdep_key]}, 'rosdistro': str|None}
+    """
+    result = {'ok': False, 'reason': None, 'missing': [], 'unresolved': {},
+              'rosdistro': rosdistro}
+    if shutil.which('rosdep') is None:
+        result['reason'] = 'rosdep is not installed'
+        return result
+
+    rosdistro = rosdistro or detect_rosdistro()
+    result['rosdistro'] = rosdistro
+    cmd = ['rosdep', 'check', '--from-paths', _rosdep_source_folder(workspace_path),
+           '--ignore-src']
+    if rosdistro:
+        cmd += ['--rosdistro', rosdistro]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        result['reason'] = f'could not run rosdep: {e}'
+        return result
+
+    output = (proc.stdout or '') + (proc.stderr or '')
+    # rosdep is unusable until `rosdep update` has populated the local cache;
+    # its own error text is cryptic, so say what to do instead of parsing on.
+    if 'rosdep update' in output or 'no sources list' in output.lower():
+        result['reason'] = ('rosdep has no local cache -- run `rosdep update` '
+                            '(and `sudo rosdep init` if never initialised)')
+        return result
+
+    result['ok'] = True
+    for pkg, key in _ROSDEP_UNRESOLVED_RE.findall(output):
+        result['unresolved'].setdefault(pkg, []).append(key)
+    # Only the block after the "not been satisfied" banner lists real installs;
+    # anything before it is diagnostic noise.
+    _, _, tail = output.partition('System dependencies have not been satisfied:')
+    for installer, pkg in _ROSDEP_MISSING_RE.findall(tail):
+        if (installer, pkg) not in result['missing']:
+            result['missing'].append((installer, pkg))
+    return result
+
+
+def report_system_deps(deps):
+    """Print what rosdep found, and the command that would fix the fixable half."""
+    if not deps:
+        return
+    if not deps.get('ok'):
+        if deps.get('reason'):
+            print(f"\nNote: system dependencies not checked -- {deps['reason']}")
+        return
+
+    missing, unresolved = deps.get('missing') or [], deps.get('unresolved') or {}
+    if not missing and not unresolved:
+        print("\nSystem dependencies: all satisfied")
+        return
+
+    if missing:
+        by_installer = {}
+        for installer, pkg in missing:
+            by_installer.setdefault(installer, []).append(pkg)
+        print(f"\nWarning: {len(missing)} system dependency(ies) not installed:")
+        for installer, pkgs in sorted(by_installer.items()):
+            print(f"  [{installer}] {' '.join(sorted(pkgs))}")
+        print("  Install with: rvcs --import-state ... --install-deps")
+        print("  or: rosdep install --from-paths src --ignore-src -r -y")
+
+    if unresolved:
+        # These survive `rosdep install -r`, which prints them and continues --
+        # easy to miss, and usually a bad key in package.xml or a repo the
+        # pipeline definition forgot.
+        total = sum(len(v) for v in unresolved.values())
+        print(f"\nWarning: {total} rosdep key(s) could not be resolved:")
+        for pkg, keys in sorted(unresolved.items()):
+            print(f"  {pkg}: {', '.join(sorted(keys))}")
+        print("  These are unknown to rosdep -- typically a wrong key in the")
+        print("  package's package.xml, or a repo missing from the pipeline.")
+
+
+def install_system_deps(workspace_path, rosdistro=None):
+    """
+    Run `rosdep install` for the workspace. Requires sudo: rosdep shells out to
+    `sudo -H apt-get`, so this is opt-in only and never part of a plain import.
+
+    Output is deliberately not captured, so the sudo password prompt reaches the
+    terminal. Returns True if rosdep exited cleanly.
+    """
+    if shutil.which('rosdep') is None:
+        print("Cannot install dependencies: rosdep is not installed")
+        return False
+    rosdistro = rosdistro or detect_rosdistro()
+    cmd = ['rosdep', 'install', '--from-paths', _rosdep_source_folder(workspace_path),
+           '--ignore-src', '-r', '-y']
+    if rosdistro:
+        cmd += ['--rosdistro', rosdistro]
+    print(f"\nInstalling system dependencies (sudo may prompt):\n  {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  rosdep install failed: {e}")
+        return False
+    if proc.returncode != 0:
+        print(f"  rosdep install exited with code {proc.returncode}")
+        return False
+    return True
+
+
 def import_workspace_state(input_file, output_dir, state_file=None, install_tmuxinator=False,
-                           rewrite_paths=True):
+                           rewrite_paths=True, install_deps=False):
     """
     Import workspace state using vcstool and optionally apply diffs.
 
@@ -895,6 +1034,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         install_tmuxinator: Also copy bundled tmuxinator configs to ~/.config/tmuxinator
         rewrite_paths: Rewrite the export-time workspace root out of the pipeline
             payload (tmuxinator configs, pipeline.yaml) so it points at output_dir
+        install_deps: Run `rosdep install` for the restored workspace afterwards.
+            Requires sudo, so it is opt-in; the check itself always runs.
 
     Returns:
         Dictionary with 'import_return_code', 'patched', 'patch_failed'
@@ -1211,6 +1352,14 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     results['path_warnings'] = check_restored_paths(output_dir)
     report_restored_paths(results['path_warnings'])
 
+    # Doctor: what the workspace still needs from the system before it builds
+    deps = check_system_deps(output_dir)
+    if install_deps and deps.get('missing'):
+        if install_system_deps(output_dir, deps.get('rosdistro')):
+            deps = check_system_deps(output_dir)   # re-check so the report is post-install
+    report_system_deps(deps)
+    results['system_deps'] = deps
+
     return results
 
 
@@ -1245,6 +1394,9 @@ Examples:
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
                         help='With --import-state: copy bundled tmuxinator configs into ~/.config/tmuxinator')
+    parser.add_argument('--install-deps', action='store_true',
+                        help='With --import-state: run rosdep install for the restored '
+                             'workspace (needs sudo). Missing deps are reported either way')
     parser.add_argument('--no-path-rewrite', action='store_true',
                         help='With --import-state: restore the pipeline payload verbatim instead of '
                              'repointing the export-time workspace root at the import directory')
@@ -1304,7 +1456,8 @@ Examples:
             exit(1)
         import_workspace_state(args.import_state, output_dir, args.state_file,
                                install_tmuxinator=args.install_tmuxinator,
-                               rewrite_paths=not args.no_path_rewrite)
+                               rewrite_paths=not args.no_path_rewrite,
+                               install_deps=args.install_deps)
         exit(0)
 
     if args.compare and args.json:
