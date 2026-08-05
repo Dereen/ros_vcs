@@ -1214,6 +1214,441 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     return results
 
 
+# ---------------------------------------------------------------------------
+# State diff: compare an exported .workspace.zip/.pipeline.zip against a live
+# workspace, browsable as a tree in a curses TUI (rvcs --diff-state ZIP [ws]).
+# ---------------------------------------------------------------------------
+
+def load_state_zip(zip_path):
+    """Parse an export zip into {name, date, repos, dirty, bundles, colcon,
+    tmuxinator, extra}. Diff payloads are base64-decoded to text."""
+    model = {'repos': {}, 'dirty': {}, 'bundles': {}, 'colcon': None,
+             'tmuxinator': {}, 'extra': {}, 'name': None, 'date': None}
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+        manifest = yaml.safe_load(zf.read('workspace.repos').decode()) or {}
+        model['repos'] = manifest.get('repositories') or {}
+        if 'workspace.state.yaml' in names:
+            state = yaml.safe_load(zf.read('workspace.state.yaml').decode()) or {}
+            model['name'] = state.get('workspace_name')
+            model['date'] = state.get('export_date')
+            model['bundles'] = state.get('bundles') or {}
+            for rel, d in (state.get('dirty_repos') or {}).items():
+                entry = {'staged': d.get('staged_diff') or '',
+                         'unstaged': d.get('unstaged_diff') or '',
+                         'untracked': d.get('untracked_files') or {}}
+                if d.get('staged_diff_encoded'):
+                    entry['staged'] = base64.b64decode(entry['staged']).decode('utf-8', 'replace')
+                if d.get('unstaged_diff_encoded'):
+                    entry['unstaged'] = base64.b64decode(entry['unstaged']).decode('utf-8', 'replace')
+                model['dirty'][rel] = entry
+        for member in ('.colcon/config.yaml', 'colcon_defaults.yaml'):
+            if member in names:
+                model['colcon'] = (member, zf.read(member).decode('utf-8', 'replace'))
+                break
+        for n in names:
+            if n.startswith('tmuxinator/') and not n.endswith('/'):
+                model['tmuxinator'][os.path.basename(n)] = zf.read(n).decode('utf-8', 'replace')
+            elif n.startswith('extra/') and not n.endswith('/'):
+                model['extra'][os.path.relpath(n, 'extra')] = zf.read(n)
+    return model
+
+
+def _split_patch_by_file(patch_text):
+    """Split a unified diff into {path: per-file patch text} by diff --git headers."""
+    files = {}
+    current, buf = None, []
+    for line in (patch_text or '').splitlines():
+        m = re.match(r'^diff --git a/(.+?) b/(.+)$', line)
+        if m:
+            if current:
+                files[current] = '\n'.join(buf)
+            current = m.group(2) if m.group(2) != '/dev/null' else m.group(1)
+            buf = [line]
+        elif current:
+            buf.append(line)
+    if current:
+        files[current] = '\n'.join(buf)
+    return files
+
+
+def _node(label, status='info', detail=None, children=None):
+    return {'label': label, 'status': status, 'detail': detail or [],
+            'children': children or [], 'expanded': False}
+
+
+def _untracked_text(entry):
+    """Decode an untracked_files entry to (is_binary, text_or_none, size)."""
+    content = entry.get('content', '')
+    if entry.get('binary'):
+        try:
+            raw = base64.b64decode(content)
+        except Exception:
+            raw = b''
+        return True, None, len(raw)
+    return False, content, len(content)
+
+
+def _diff_repo_files(zdirty, ldirty):
+    """Compare per-file uncommitted changes of one repo between zip and local.
+    Returns (child nodes, counts dict)."""
+    zfiles = _split_patch_by_file(zdirty.get('staged', ''))
+    zfiles.update(_split_patch_by_file(zdirty.get('unstaged', '')))
+    lfiles = _split_patch_by_file(ldirty.get('staged', ''))
+    lfiles.update(_split_patch_by_file(ldirty.get('unstaged', '')))
+    zun, lun = zdirty.get('untracked', {}), ldirty.get('untracked', {})
+
+    nodes, counts = [], {'+': 0, '-': 0, '~': 0, '=': 0}
+    for path in sorted(set(zfiles) | set(lfiles)):
+        zp, lp = zfiles.get(path), lfiles.get(path)
+        if zp is not None and lp is None:
+            counts['+'] += 1
+            nodes.append(_node(f"{path}  (modified only in zip)", 'added',
+                               ['── patch in zip ──'] + zp.splitlines()))
+        elif lp is not None and zp is None:
+            counts['-'] += 1
+            nodes.append(_node(f"{path}  (modified only locally)", 'removed',
+                               ['── patch in local workspace ──'] + lp.splitlines()))
+        elif zp != lp:
+            counts['~'] += 1
+            nodes.append(_node(f"{path}  (patches differ)", 'changed',
+                               ['── patch in zip ──'] + zp.splitlines() +
+                               ['', '── patch in local workspace ──'] + lp.splitlines()))
+        else:
+            counts['='] += 1
+            nodes.append(_node(f"{path}  (same patch)", 'same',
+                               ['Identical uncommitted patch on both sides.', ''] + zp.splitlines()))
+    for path in sorted(set(zun) | set(lun)):
+        ze, le = zun.get(path), lun.get(path)
+        label_path = f"{path} (untracked)"
+        if ze is not None and le is None:
+            zb, ztext, zsize = _untracked_text(ze)
+            counts['+'] += 1
+            detail = ['── new file, only in zip ──'] + \
+                     (['<binary, %d bytes>' % zsize] if zb else (ztext or '').splitlines())
+            nodes.append(_node(f"{label_path}  (only in zip)", 'added', detail))
+        elif le is not None and ze is None:
+            lb, ltext, lsize = _untracked_text(le)
+            counts['-'] += 1
+            detail = ['── new file, only in local workspace ──'] + \
+                     (['<binary, %d bytes>' % lsize] if lb else (ltext or '').splitlines())
+            nodes.append(_node(f"{label_path}  (only locally)", 'removed', detail))
+        else:
+            zb, ztext, zsize = _untracked_text(ze)
+            lb, ltext, lsize = _untracked_text(le)
+            if zb or lb:
+                same = ze.get('content') == le.get('content')
+                st = 'same' if same else 'changed'
+                counts['=' if same else '~'] += 1
+                nodes.append(_node(f"{label_path}  ({'same' if same else 'binary differs'})", st,
+                                   ['<binary: zip %d bytes, local %d bytes>' % (zsize, lsize)]))
+            elif ztext == ltext:
+                counts['='] += 1
+                nodes.append(_node(f"{label_path}  (same content)", 'same',
+                                   (ztext or '').splitlines()))
+            else:
+                import difflib
+                counts['~'] += 1
+                d = list(difflib.unified_diff((ltext or '').splitlines(),
+                                              (ztext or '').splitlines(),
+                                              'local/' + path, 'zip/' + path, lineterm=''))
+                nodes.append(_node(f"{label_path}  (content differs)", 'changed', d))
+    return nodes, counts
+
+
+def _repo_commit_info(repo_path, zip_sha):
+    """Describe how local HEAD relates to the zip's recorded commit."""
+    lines, status = [], 'changed'
+    try:
+        repo = git.Repo(repo_path)
+        local_sha = repo.head.commit.hexsha
+        if local_sha == zip_sha:
+            return 'same', []
+        try:
+            repo.commit(zip_sha)  # is the zip commit known locally?
+        except Exception:
+            lines.append("zip HEAD %s is NOT in local history — commits made on the "
+                         "other machine (check bundles/ in the zip)." % zip_sha[:9])
+            return status, lines
+        ahead = repo.git.rev_list('--count', f'{zip_sha}..HEAD')
+        behind = repo.git.rev_list('--count', f'HEAD..{zip_sha}')
+        lines.append(f"local ahead by {ahead}, behind by {behind} (vs zip {zip_sha[:9]})")
+        if int(ahead):
+            lines.append('')
+            lines.append('── commits only in local workspace ──')
+            lines += repo.git.log('--oneline', f'{zip_sha}..HEAD').splitlines()[:20]
+        if int(behind):
+            lines.append('')
+            lines.append('── commits only in zip ──')
+            lines += repo.git.log('--oneline', f'HEAD..{zip_sha}').splitlines()[:20]
+    except Exception as e:
+        lines.append(f'(could not inspect local repo: {e})')
+    return status, lines
+
+
+def compute_state_diff(zip_path, workspace, include_paths=None):
+    """Build the diff tree (zip state vs live workspace) as nested nodes."""
+    zm = load_state_zip(zip_path)
+    source_folder = os.path.join(workspace, 'src')
+    if not os.path.exists(source_folder):
+        source_folder = workspace
+
+    local_repos = {}
+    for p in find_git_repos(source_folder):
+        rel = os.path.relpath(p, source_folder)
+        if repo_in_include_paths(rel, include_paths):
+            local_repos[rel] = p
+
+    zrepos = {rel: e for rel, e in zm['repos'].items()
+              if repo_in_include_paths(rel, include_paths)}
+
+    root = _node(f"{os.path.basename(zip_path)}  vs  {workspace}", 'info')
+    root['expanded'] = True
+    summary = {'+': 0, '-': 0, '~': 0, '=': 0}
+
+    repos_sec = _node('repos', 'info'); repos_sec['expanded'] = True
+    for rel in sorted(zrepos):
+        zentry = zrepos.get(rel)
+        lpath = local_repos.get(rel)
+        if lpath is None:
+            summary['+'] += 1
+            det = [f"In the zip but not in the local workspace.",
+                   f"url: {zentry.get('url')}", f"version: {zentry.get('version')}"]
+            repos_sec['children'].append(_node(f"{rel}  (only in zip)", 'added', det))
+            continue
+        zsha = str(zentry.get('version') or '')
+        cstatus, clines = _repo_commit_info(lpath, zsha)
+        zdirty = zm['dirty'].get(rel, {})
+        ldirty = get_repo_diff(lpath) or {}
+        ldirty = {'staged': ldirty.get('staged_diff', ''),
+                  'unstaged': ldirty.get('unstaged_diff', ''),
+                  'untracked': ldirty.get('untracked_files', {})}
+        file_nodes, fcounts = _diff_repo_files(zdirty, ldirty)
+        dirty_differs = fcounts['+'] or fcounts['-'] or fcounts['~']
+        if cstatus == 'same' and not dirty_differs:
+            summary['='] += 1
+            n = _node(f"{rel}  (in sync)", 'same',
+                      ['HEAD and uncommitted state match the zip.'])
+            n['children'] = [c for c in file_nodes]  # identical patches, browsable
+            repos_sec['children'].append(n)
+            continue
+        summary['~'] += 1
+        bits = []
+        if cstatus != 'same':
+            bits.append('commits differ')
+        if dirty_differs:
+            bits.append('changes: +%d -%d ~%d' % (fcounts['+'], fcounts['-'], fcounts['~']))
+        n = _node(f"{rel}  ({', '.join(bits)})", 'changed', clines)
+        n['children'] = file_nodes
+        repos_sec['children'].append(n)
+
+    local_only = sorted(set(local_repos) - set(zrepos))
+    if local_only:
+        lo = _node(f"local-only repos not in zip ({len(local_only)})", 'info',
+                   ['Present in the local workspace but not exported in this zip',
+                    '(the zip may cover a smaller pipeline).', ''] + local_only)
+        repos_sec['children'].append(lo)
+    root['children'].append(repos_sec)
+
+    if zm['bundles']:
+        blines = []
+        for rel, meta in sorted(zm['bundles'].items()):
+            kind = 'full history' if meta.get('self_contained') else 'unpushed commits only'
+            blines.append(f"{rel}  ({kind})")
+        root['children'].append(_node(f"git bundles in zip ({len(zm['bundles'])})", 'info',
+                                      ['Commits that exist only on the exporting machine:',
+                                       ''] + blines))
+
+    if zm['colcon']:
+        member, ztext = zm['colcon']
+        local_colcon = os.path.join(workspace, '.colcon', 'config.yaml')
+        if os.path.isfile(local_colcon):
+            ltext = open(local_colcon, encoding='utf-8', errors='replace').read()
+            if ltext == ztext:
+                root['children'].append(_node('colcon config (same)', 'same', ztext.splitlines()))
+            else:
+                import difflib
+                d = list(difflib.unified_diff(ltext.splitlines(), ztext.splitlines(),
+                                              'local/.colcon/config.yaml', 'zip/' + member,
+                                              lineterm=''))
+                summary['~'] += 1
+                root['children'].append(_node('colcon config (differs)', 'changed', d))
+        else:
+            summary['+'] += 1
+            root['children'].append(_node(f'colcon config (only in zip: {member})', 'added',
+                                          ztext.splitlines()))
+
+    for name, ztext in sorted(zm['tmuxinator'].items()):
+        local_t = os.path.expanduser(os.path.join('~/.config/tmuxinator', name))
+        if os.path.isfile(local_t):
+            ltext = open(local_t, encoding='utf-8', errors='replace').read()
+            if ltext == ztext:
+                root['children'].append(_node(f'tmuxinator/{name} (same)', 'same', ztext.splitlines()))
+            else:
+                import difflib
+                d = list(difflib.unified_diff(ltext.splitlines(), ztext.splitlines(),
+                                              'local/' + name, 'zip/' + name, lineterm=''))
+                summary['~'] += 1
+                root['children'].append(_node(f'tmuxinator/{name} (differs)', 'changed', d))
+        else:
+            summary['+'] += 1
+            root['children'].append(_node(f'tmuxinator/{name} (only in zip)', 'added',
+                                          ztext.splitlines()))
+
+    src = zm['name'] or '?'
+    root['detail'] = [
+        f"zip:       {zip_path}",
+        f"exported:  {src}  @  {zm['date'] or '?'}",
+        f"workspace: {workspace}",
+        '',
+        'repos: %d in zip, %d compared, %d local-only skipped' % (
+            len(zrepos), len(set(zrepos) & set(local_repos)), len(local_only)),
+        'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
+        '',
+        'keys: j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
+    ]
+    return root
+
+
+_STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' '}
+
+
+def print_state_diff(root, detail=False, _depth=0):
+    """Plain-text fallback when stdout is not a terminal (or --no-tui)."""
+    glyph = _STATUS_GLYPH.get(root['status'], ' ')
+    print('%s%s %s' % ('  ' * _depth, glyph, root['label']))
+    if detail:
+        for line in root['detail']:
+            print('%s    %s' % ('  ' * _depth, line))
+    for c in root['children']:
+        print_state_diff(c, detail=detail, _depth=_depth + 1)
+
+
+def run_diff_tui(root):
+    """Curses tree browser: left pane = diff tree, right pane = node detail."""
+    import curses
+
+    def flatten(node, depth=0, out=None):
+        out = [] if out is None else out
+        out.append((node, depth))
+        if node['expanded']:
+            for c in node['children']:
+                flatten(c, depth + 1, out)
+        return out
+
+    def draw(stdscr, rows, sel, tree_top, detail_off, colors):
+        stdscr.erase()
+        maxy, maxx = stdscr.getmaxyx()
+        split = max(34, int(maxx * 0.45))
+        tree_h = maxy - 1
+        for i in range(tree_h):
+            idx = tree_top + i
+            if idx >= len(rows):
+                break
+            node, depth = rows[idx]
+            mark = ' '
+            if node['children']:
+                mark = '▾' if node['expanded'] else '▸'
+            glyph = _STATUS_GLYPH.get(node['status'], ' ')
+            text = '%s%s %s %s' % ('  ' * depth, mark, glyph, node['label'])
+            attr = colors.get(node['status'], 0)
+            if idx == sel:
+                attr |= curses.A_REVERSE
+            try:
+                stdscr.addnstr(i, 0, text.ljust(split - 1), split - 1, attr)
+            except curses.error:
+                pass
+        for i in range(tree_h):
+            try:
+                stdscr.addstr(i, split - 1, '│')
+            except curses.error:
+                pass
+        detail = rows[sel][0]['detail'] if sel < len(rows) else []
+        dw = maxx - split - 1
+        for i in range(tree_h):
+            li = detail_off + i
+            if li >= len(detail):
+                break
+            line = detail[li]
+            attr = 0
+            if line.startswith('+') and not line.startswith('+++'):
+                attr = colors.get('added', 0)
+            elif line.startswith('-') and not line.startswith('---'):
+                attr = colors.get('removed', 0)
+            elif line.startswith('@@') or line.startswith('──'):
+                attr = colors.get('info', 0)
+            try:
+                stdscr.addnstr(i, split, line, dw, attr)
+            except curses.error:
+                pass
+        status = ' %d/%d   j/k move  l/Enter expand  h collapse  J/K/PgUp/PgDn detail  g/G  q quit' % (
+            sel + 1, len(rows))
+        try:
+            stdscr.addnstr(maxy - 1, 0, status.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    def tui(stdscr):
+        curses.curs_set(0)
+        colors = {}
+        if curses.has_colors():
+            curses.use_default_colors()
+            for i, (st, col) in enumerate(
+                    [('added', curses.COLOR_GREEN), ('removed', curses.COLOR_RED),
+                     ('changed', curses.COLOR_YELLOW), ('info', curses.COLOR_CYAN)], 1):
+                curses.init_pair(i, col, -1)
+                colors[st] = curses.color_pair(i)
+            colors['same'] = curses.A_DIM
+        sel, tree_top, detail_off = 0, 0, 0
+        while True:
+            rows = flatten(root)
+            sel = max(0, min(sel, len(rows) - 1))
+            maxy, _ = stdscr.getmaxyx()
+            tree_h = maxy - 1
+            if sel < tree_top:
+                tree_top = sel
+            elif sel >= tree_top + tree_h:
+                tree_top = sel - tree_h + 1
+            draw(stdscr, rows, sel, tree_top, detail_off, colors)
+            ch = stdscr.getch()
+            node = rows[sel][0]
+            if ch in (ord('q'), 27):
+                return
+            elif ch in (ord('j'), curses.KEY_DOWN):
+                sel += 1; detail_off = 0
+            elif ch in (ord('k'), curses.KEY_UP):
+                sel -= 1; detail_off = 0
+            elif ch in (ord('l'), curses.KEY_RIGHT):
+                if node['children']:
+                    node['expanded'] = True
+            elif ch in (ord('\n'), curses.KEY_ENTER, ord(' ')):
+                if node['children']:
+                    node['expanded'] = not node['expanded']
+            elif ch in (ord('h'), curses.KEY_LEFT):
+                if node['expanded']:
+                    node['expanded'] = False
+                else:  # jump to parent
+                    d = rows[sel][1]
+                    for i in range(sel - 1, -1, -1):
+                        if rows[i][1] < d:
+                            sel = i; break
+                detail_off = 0
+            elif ch == ord('J') or ch == curses.KEY_NPAGE:
+                detail_off += (10 if ch == ord('J') else tree_h)
+                detail_off = max(0, min(detail_off, max(0, len(node['detail']) - 5)))
+            elif ch == ord('K') or ch == curses.KEY_PPAGE:
+                detail_off = max(0, detail_off - (10 if ch == ord('K') else tree_h))
+            elif ch == ord('g'):
+                sel = 0; detail_off = 0
+            elif ch == ord('G'):
+                sel = len(rows) - 1; detail_off = 0
+            elif ch == curses.KEY_RESIZE:
+                pass
+
+    curses.wrapper(tui)
+
+
 def main():
     """Main entry point for CLI."""
     global _debug
@@ -1241,6 +1676,11 @@ Examples:
                         help='Export a pipeline slice (.pipeline.yaml) incl. tmuxinator configs')
     parser.add_argument('--pipeline', metavar='PIPELINE_FILE',
                         help='Restrict status/compare to the repos of a pipeline definition')
+    parser.add_argument('--diff-state', metavar='ZIP',
+                        help='Diff an exported .workspace.zip/.pipeline.zip against a live '
+                             'workspace, browsable as a tree (curses TUI on a terminal)')
+    parser.add_argument('--no-tui', action='store_true',
+                        help='With --diff-state: print the tree instead of the interactive TUI')
     parser.add_argument('--import-state', help='Import workspace from .workspace.zip/.pipeline.zip or .repos file')
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
@@ -1271,6 +1711,27 @@ Examples:
         args.export_pipeline = os.path.expanduser(args.export_pipeline)
     if args.pipeline:
         args.pipeline = os.path.expanduser(args.pipeline)
+
+    # Handle --diff-state mode
+    if args.diff_state:
+        if args.compare or args.json or args.import_state or args.export_state or args.export_pipeline:
+            print("Cannot use other options with --diff-state")
+            exit(1)
+        include = None
+        workspace = args.workspace
+        if args.pipeline:
+            p = load_pipeline(os.path.expanduser(args.pipeline))
+            include = p['repos'] or None
+            if workspace is None:
+                workspace = p.get('workspace')
+        workspace = workspace or os.getcwd()
+        root = compute_state_diff(os.path.expanduser(args.diff_state), workspace,
+                                  include_paths=include)
+        if args.no_tui or not sys.stdout.isatty():
+            print_state_diff(root, detail=args.debug)
+        else:
+            run_diff_tui(root)
+        exit(0)
 
     # Handle --export-pipeline mode
     if args.export_pipeline:

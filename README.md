@@ -158,6 +158,27 @@ Warning: 62 reference(s) to paths that do not exist on this machine:
       ...
 ```
 
+### Diff an export against a live workspace (TUI)
+
+When a collaborator sends their exported state back, browse what changed before
+deciding what to take:
+
+```bash
+./rvcs.py --diff-state flipper_eval_marv_2026-08-05.workspace.zip ~/marv_ws
+./rvcs.py --diff-state export.zip --pipeline flipper_eval.pipeline.yaml   # restrict to a pipeline
+./rvcs.py --diff-state export.zip ~/marv_ws --no-tui                      # plain tree to stdout
+```
+
+On a terminal this opens a curses tree (detail pane on the right): repos marked
+`+` only-in-zip / `-` only-local / `~` differing / `=` in sync; a differing repo
+expands into per-file nodes whose detail shows both sides' patches, untracked
+file diffs, and how the commits relate (ahead/behind with the commit list, or a
+note when the zip HEAD only exists on the other machine — check its `bundles/`).
+tmuxinator configs and the colcon config are compared too; repos that exist
+locally but not in the zip are summarized, not flagged. Keys: `j/k` move,
+`l`/`Enter` expand, `h` collapse (again: jump to parent), `J/K`/`PgUp/PgDn`
+scroll the detail pane, `g/G` top/bottom, `q` quit.
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:
