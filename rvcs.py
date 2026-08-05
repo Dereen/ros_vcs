@@ -1505,7 +1505,8 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             len(zrepos), len(set(zrepos) & set(local_repos)), len(local_only)),
         'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
         '',
-        'keys: j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
+        'legend: + only in zip   - only local   ~ differs   = in sync   ▸/▾ expandable',
+        'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
     ]
     return root
 
@@ -1536,11 +1537,15 @@ def run_diff_tui(root):
                 flatten(c, depth + 1, out)
         return out
 
+    LEGEND = [('+ only in zip', 'added'), ('- only local', 'removed'),
+              ('~ differs', 'changed'), ('= in sync', 'same'),
+              ('▸/▾ expandable', 'info')]
+
     def draw(stdscr, rows, sel, tree_top, detail_off, colors):
         stdscr.erase()
         maxy, maxx = stdscr.getmaxyx()
         split = max(34, int(maxx * 0.45))
-        tree_h = maxy - 1
+        tree_h = maxy - 2
         for i in range(tree_h):
             idx = tree_top + i
             if idx >= len(rows):
@@ -1581,6 +1586,14 @@ def run_diff_tui(root):
                 stdscr.addnstr(i, split, line, dw, attr)
             except curses.error:
                 pass
+        x = 1
+        for text, st in LEGEND:
+            try:
+                stdscr.addnstr(maxy - 2, x, text, max(0, maxx - 1 - x),
+                               colors.get(st, 0) | curses.A_BOLD)
+            except curses.error:
+                pass
+            x += len(text) + 3
         status = ' %d/%d   j/k move  l/Enter expand  h collapse  J/K/PgUp/PgDn detail  g/G  q quit' % (
             sel + 1, len(rows))
         try:
@@ -1605,7 +1618,7 @@ def run_diff_tui(root):
             rows = flatten(root)
             sel = max(0, min(sel, len(rows) - 1))
             maxy, _ = stdscr.getmaxyx()
-            tree_h = maxy - 1
+            tree_h = maxy - 2
             if sel < tree_top:
                 tree_top = sel
             elif sel >= tree_top + tree_h:
