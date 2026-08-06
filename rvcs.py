@@ -1824,7 +1824,7 @@ def run_diff_tui(root, ctx=None):
             line = detail[li]
             attr = 0
             if line.startswith(('<<<<<<<', '=======', '>>>>>>>')):
-                attr = colors.get('conflict', 0) | curses.A_BOLD
+                attr = colors.get('confmark', colors.get('conflict', 0)) | curses.A_BOLD
             elif line.startswith('+') and not line.startswith('+++'):
                 attr = colors.get('added', 0)
             elif line.startswith('-') and not line.startswith('---'):
@@ -1874,6 +1874,9 @@ def run_diff_tui(root, ctx=None):
                 colors[st] = curses.color_pair(i)
             colors['same'] = curses.A_DIM
             colors['done'] = colors['added'] | curses.A_DIM
+            # conflict markers: white on red — survives any terminal theme
+            curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)
+            colors['confmark'] = curses.color_pair(9)
         sel, tree_top, detail_off = 0, 0, 0
         while True:
             rows = flatten(root)
