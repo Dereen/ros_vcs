@@ -1874,8 +1874,15 @@ def run_diff_tui(root, ctx=None):
                 colors[st] = curses.color_pair(i)
             colors['same'] = curses.A_DIM
             colors['done'] = colors['added'] | curses.A_DIM
-            # conflict markers: white on red — survives any terminal theme
-            curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)
+            # Conflict colors. Terminal themes remap the base-16 palette (some
+            # render red/yellow/magenta all orange-ish), but the 256-color cube
+            # is not themable — use a true purple from it when available.
+            if curses.COLORS >= 256:
+                curses.init_pair(9, 231, 93)    # white on purple (cube)
+                curses.init_pair(10, 135, -1)   # purple foreground (cube)
+                colors['conflict'] = curses.color_pair(10)
+            else:
+                curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
             colors['confmark'] = curses.color_pair(9)
         sel, tree_top, detail_off = 0, 0, 0
         while True:
