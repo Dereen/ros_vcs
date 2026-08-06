@@ -1823,7 +1823,9 @@ def run_diff_tui(root, ctx=None):
                 break
             line = detail[li]
             attr = 0
-            if line.startswith('+') and not line.startswith('+++'):
+            if line.startswith(('<<<<<<<', '=======', '>>>>>>>')):
+                attr = colors.get('conflict', 0) | curses.A_BOLD
+            elif line.startswith('+') and not line.startswith('+++'):
                 attr = colors.get('added', 0)
             elif line.startswith('-') and not line.startswith('---'):
                 attr = colors.get('removed', 0)
@@ -1936,7 +1938,10 @@ def run_diff_tui(root, ctx=None):
             elif ch == curses.KEY_RESIZE:
                 pass
 
-    curses.wrapper(tui)
+    try:
+        curses.wrapper(tui)
+    except KeyboardInterrupt:
+        pass  # Ctrl-C quits like q, without a traceback
 
 
 def main():
