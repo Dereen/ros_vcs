@@ -1876,13 +1876,13 @@ def run_diff_tui(root, ctx=None):
             colors['done'] = colors['added'] | curses.A_DIM
             # Conflict colors. Terminal themes remap the base-16 palette (some
             # render red/yellow/magenta all orange-ish), but the 256-color cube
-            # is not themable — use a true purple from it when available.
+            # is not themable. Tree nodes: purple; in-file markers: true red.
             if curses.COLORS >= 256:
-                curses.init_pair(9, 231, 93)    # white on purple (cube)
-                curses.init_pair(10, 135, -1)   # purple foreground (cube)
+                curses.init_pair(9, 231, 196)   # white on pure red (cube) — markers
+                curses.init_pair(10, 135, -1)   # purple foreground (cube) — tree
                 colors['conflict'] = curses.color_pair(10)
             else:
-                curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_MAGENTA)
+                curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)
             colors['confmark'] = curses.color_pair(9)
         sel, tree_top, detail_off = 0, 0, 0
         while True:
