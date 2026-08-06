@@ -179,6 +179,31 @@ locally but not in the zip are summarized, not flagged. Keys: `j/k` move,
 `l`/`Enter` expand, `h` collapse (again: jump to parent), `J/K`/`PgUp/PgDn`
 scroll the detail pane, `g/G` top/bottom, `q` quit.
 
+The tree is also a MERGE tool — every action applies to the selected node
+*and everything beneath it*, so it works from a single file up to a whole repo:
+
+| Key | Action |
+|-----|--------|
+| `d` | preview the 3-way merge of the selected file (conflict markers shown, nothing written) |
+| `o` | accept **ours** — keep the local side |
+| `t` | accept **theirs** — make the local file(s) match the zip (after y/N confirm) |
+| `m` | 3-way **merge** (base = local HEAD): non-overlapping changes combine, overlaps get `<<<<<<< local` / `>>>>>>> zip` conflict markers written into the file for manual resolution |
+| `M` | merge **all** — the whole tree |
+
+Resolved nodes turn `✓`, conflicted ones `!`. Before the first modification of
+any file its original is copied to `/tmp/rvcs_merge_backup_<timestamp>/`, and
+the backup path is shown in the root node after every action. Commit
+divergence is reported but never merged automatically — fetch the zip's
+`bundles/` for that.
+
+For scripts and AI tooling (e.g. Claude Code), dump the same tree as JSON
+instead of opening the TUI:
+
+```bash
+./rvcs.py --diff-state export.zip ~/marv_ws --diff-json -          # stdout
+./rvcs.py --diff-state export.zip ~/marv_ws --diff-json diff.json  # file
+```
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:

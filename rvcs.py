@@ -1289,9 +1289,10 @@ def _untracked_text(entry):
     return False, content, len(content)
 
 
-def _diff_repo_files(zdirty, ldirty):
+def _diff_repo_files(zdirty, ldirty, repo_path=None):
     """Compare per-file uncommitted changes of one repo between zip and local.
-    Returns (child nodes, counts dict)."""
+    Returns (child nodes, counts dict). Nodes carry an 'act' payload so the
+    TUI can merge/accept them (repo_path, file, zip patch/content, side)."""
     zfiles = _split_patch_by_file(zdirty.get('staged', ''))
     zfiles.update(_split_patch_by_file(zdirty.get('unstaged', '')))
     lfiles = _split_patch_by_file(ldirty.get('staged', ''))
@@ -1301,6 +1302,8 @@ def _diff_repo_files(zdirty, ldirty):
     nodes, counts = [], {'+': 0, '-': 0, '~': 0, '=': 0}
     for path in sorted(set(zfiles) | set(lfiles)):
         zp, lp = zfiles.get(path), lfiles.get(path)
+        act = {'kind': 'patch', 'repo': repo_path, 'file': path,
+               'zip_patch': zp, 'local_patch': lp}
         if zp is not None and lp is None:
             counts['+'] += 1
             nodes.append(_node(f"{path}  (modified only in zip)", 'added',
@@ -1318,9 +1321,12 @@ def _diff_repo_files(zdirty, ldirty):
             counts['='] += 1
             nodes.append(_node(f"{path}  (same patch)", 'same',
                                ['Identical uncommitted patch on both sides.', ''] + zp.splitlines()))
+        nodes[-1]['act'] = act
     for path in sorted(set(zun) | set(lun)):
         ze, le = zun.get(path), lun.get(path)
         label_path = f"{path} (untracked)"
+        uact = {'kind': 'untracked', 'repo': repo_path, 'file': path,
+                'zip_entry': ze, 'local_entry': le}
         if ze is not None and le is None:
             zb, ztext, zsize = _untracked_text(ze)
             counts['+'] += 1
@@ -1353,6 +1359,7 @@ def _diff_repo_files(zdirty, ldirty):
                                               (ztext or '').splitlines(),
                                               'local/' + path, 'zip/' + path, lineterm=''))
                 nodes.append(_node(f"{label_path}  (content differs)", 'changed', d))
+        nodes[-1]['act'] = uact
     return nodes, counts
 
 
@@ -1423,7 +1430,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         ldirty = {'staged': ldirty.get('staged_diff', ''),
                   'unstaged': ldirty.get('unstaged_diff', ''),
                   'untracked': ldirty.get('untracked_files', {})}
-        file_nodes, fcounts = _diff_repo_files(zdirty, ldirty)
+        file_nodes, fcounts = _diff_repo_files(zdirty, ldirty, repo_path=lpath)
         dirty_differs = fcounts['+'] or fcounts['-'] or fcounts['~']
         if cstatus == 'same' and not dirty_differs:
             summary['='] += 1
@@ -1462,6 +1469,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
     if zm['colcon']:
         member, ztext = zm['colcon']
         local_colcon = os.path.join(workspace, '.colcon', 'config.yaml')
+        cact = {'kind': 'plainfile', 'local_path': local_colcon, 'zip_text': ztext}
         if os.path.isfile(local_colcon):
             ltext = open(local_colcon, encoding='utf-8', errors='replace').read()
             if ltext == ztext:
@@ -1477,9 +1485,11 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             summary['+'] += 1
             root['children'].append(_node(f'colcon config (only in zip: {member})', 'added',
                                           ztext.splitlines()))
+        root['children'][-1]['act'] = cact
 
     for name, ztext in sorted(zm['tmuxinator'].items()):
         local_t = os.path.expanduser(os.path.join('~/.config/tmuxinator', name))
+        tact = {'kind': 'plainfile', 'local_path': local_t, 'zip_text': ztext}
         if os.path.isfile(local_t):
             ltext = open(local_t, encoding='utf-8', errors='replace').read()
             if ltext == ztext:
@@ -1494,6 +1504,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             summary['+'] += 1
             root['children'].append(_node(f'tmuxinator/{name} (only in zip)', 'added',
                                           ztext.splitlines()))
+        root['children'][-1]['act'] = tact
 
     src = zm['name'] or '?'
     root['detail'] = [
@@ -1505,13 +1516,248 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             len(zrepos), len(set(zrepos) & set(local_repos)), len(local_only)),
         'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
         '',
-        'legend: + only in zip   - only local   ~ differs   = in sync   ▸/▾ expandable',
+        'legend: + only in zip   - only local   ~ differs   = in sync   ✓ resolved   ! conflict',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
+        'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
+        '        (o/t/m act on the selected node AND everything beneath it;',
+        '         originals are backed up under /tmp/rvcs_merge_backup_*)',
     ]
     return root
 
 
-_STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' '}
+_STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' ',
+                 'done': '✓', 'conflict': '!'}
+
+
+# --- merge actions (accept ours / accept theirs / 3-way merge) --------------
+
+class _MergeCtx:
+    """Backup dir + result log shared by all actions of one TUI session."""
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self.backup_dir = None
+        self.results = []
+
+    def backup(self, path):
+        """Copy a file into the session backup dir before first modification."""
+        if not os.path.exists(path):
+            return
+        if self.backup_dir is None:
+            stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            self.backup_dir = os.path.join(tempfile.gettempdir(), f'rvcs_merge_backup_{stamp}')
+        rel = os.path.relpath(path, self.workspace)
+        if rel.startswith('..'):
+            rel = path.lstrip(os.sep)
+        dest = os.path.join(self.backup_dir, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if not os.path.exists(dest):  # keep the ORIGINAL, not intermediate states
+            shutil.copy2(path, dest)
+
+    def log(self, line):
+        self.results.append(line)
+
+
+def _git_show_head(repo_path, rel_file):
+    """Content of rel_file at local HEAD ('' if the file is new/unknown).
+    Raw subprocess on purpose: GitPython's .git.show() strips the trailing
+    newline, which breaks patch application and 3-way merges."""
+    import subprocess
+    try:
+        r = subprocess.run(['git', '-C', repo_path, 'show', f'HEAD:{rel_file}'],
+                           capture_output=True)
+        return r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else ''
+    except Exception:
+        return ''
+
+
+def _apply_patch_to_text(base_text, patch_text, rel_file):
+    """Apply a per-file unified diff to base_text (returns new text or None).
+    Runs `git apply` inside a scratch repo so we never touch the real one."""
+    with tempfile.TemporaryDirectory(prefix='rvcs_apply_') as td:
+        target = os.path.join(td, rel_file)
+        os.makedirs(os.path.dirname(target) or td, exist_ok=True)
+        with open(target, 'w', encoding='utf-8', errors='replace') as f:
+            f.write(base_text)
+        pfile = os.path.join(td, '.rvcs.patch')
+        with open(pfile, 'w', encoding='utf-8', errors='replace') as f:
+            f.write(patch_text if patch_text.endswith('\n') else patch_text + '\n')
+        try:
+            import subprocess
+            subprocess.run(['git', 'init', '-q', td], check=True, capture_output=True)
+            subprocess.run(['git', '-C', td, 'apply', '.rvcs.patch'],
+                           check=True, capture_output=True)
+            with open(target, encoding='utf-8', errors='replace') as f:
+                return f.read()
+        except Exception:
+            return None
+
+
+def _merge_texts(ours, base, theirs, label_ours='local', label_theirs='zip'):
+    """3-way merge via git merge-file. Returns (merged_text, n_conflicts)."""
+    import subprocess
+    with tempfile.TemporaryDirectory(prefix='rvcs_merge_') as td:
+        po, pb, pt = (os.path.join(td, n) for n in ('ours', 'base', 'theirs'))
+        for p, t in ((po, ours), (pb, base), (pt, theirs)):
+            with open(p, 'w', encoding='utf-8', errors='replace') as f:
+                f.write(t)
+        r = subprocess.run(['git', 'merge-file', '-L', label_ours, '-L', 'base',
+                            '-L', label_theirs, po, pb, pt], capture_output=True)
+        with open(po, encoding='utf-8', errors='replace') as f:
+            merged = f.read()
+        return merged, max(0, r.returncode)
+
+
+def _merge_preview(node):
+    """Detail lines showing what a 3-way merge of this node would produce."""
+    act = node.get('act') or {}
+    if act.get('kind') == 'patch' and act.get('zip_patch') and act.get('local_patch'):
+        base = _git_show_head(act['repo'], act['file'])
+        theirs = _apply_patch_to_text(base, act['zip_patch'], act['file'])
+        local_path = os.path.join(act['repo'], act['file'])
+        try:
+            ours = open(local_path, encoding='utf-8', errors='replace').read()
+        except OSError:
+            ours = ''
+        if theirs is None:
+            return ['(cannot preview: zip patch does not apply onto local HEAD '
+                    'version of the file)']
+        merged, n = _merge_texts(ours, base, theirs)
+        head = ['── 3-way merge preview: %d conflict(s) ──' % n, '']
+        return head + merged.splitlines()
+    if act.get('kind') == 'untracked' and act.get('zip_entry') and act.get('local_entry'):
+        zb, ztext, _ = _untracked_text(act['zip_entry'])
+        lb, ltext, _ = _untracked_text(act['local_entry'])
+        if zb or lb:
+            return ['(binary file: no merge preview — use o/t to pick a side)']
+        merged, n = _merge_texts(ltext or '', '', ztext or '')
+        return ['── 3-way merge preview (no common base): %d conflict(s) ──' % n,
+                ''] + merged.splitlines()
+    return ['(no merge preview for this node — d works on files changed on '
+            'BOTH sides)']
+
+
+def _write_local(ctx, path, text):
+    ctx.backup(path)
+    os.makedirs(os.path.dirname(path) or '/', exist_ok=True)
+    with open(path, 'w', encoding='utf-8', errors='replace') as f:
+        f.write(text)
+
+
+def _finish(node, status, note):
+    node['status'] = status
+    base = node['label'].split('  (')[0]
+    node['label'] = f"{base}  ({note})"
+    return note
+
+
+def apply_action(node, mode, ctx):
+    """Apply 'ours'/'theirs'/'merge' to ONE node. Returns a result line or None
+    (None = nothing actionable on this node)."""
+    act = node.get('act')
+    if not act or node['status'] in ('done', 'conflict', 'same'):
+        return None
+    kind = act['kind']
+
+    if kind == 'plainfile':
+        if mode == 'ours':
+            return _finish(node, 'done', 'kept local')
+        _write_local(ctx, act['local_path'], act['zip_text'])
+        return _finish(node, 'done', 'took zip version')
+
+    repo_path, rel_file = act.get('repo'), act.get('file')
+    local_path = os.path.join(repo_path, rel_file) if repo_path else None
+
+    if kind == 'untracked':
+        ze, le = act.get('zip_entry'), act.get('local_entry')
+        if mode == 'ours':
+            return _finish(node, 'done', 'kept local')
+        if ze is None:                       # local-only file, theirs = remove it
+            if mode == 'merge':
+                return _finish(node, 'done', 'kept local (zip has no version)')
+            ctx.backup(local_path)
+            os.unlink(local_path)
+            return _finish(node, 'done', 'removed (not in zip)')
+        zb, ztext, _ = _untracked_text(ze)
+        if le is None or mode == 'theirs':   # take zip content
+            if zb:
+                raw = base64.b64decode(ze.get('content', ''))
+                ctx.backup(local_path)
+                os.makedirs(os.path.dirname(local_path) or '/', exist_ok=True)
+                with open(local_path, 'wb') as f:
+                    f.write(raw)
+            else:
+                _write_local(ctx, local_path, ztext or '')
+            return _finish(node, 'done', 'took zip version')
+        lb, ltext, _ = _untracked_text(le)
+        if zb or lb:
+            return _finish(node, 'conflict', 'binary differs — pick o/t')
+        merged, n = _merge_texts(ltext or '', '', ztext or '')
+        _write_local(ctx, local_path, merged)
+        if n:
+            return _finish(node, 'conflict', f'{n} conflict(s) — markers written')
+        return _finish(node, 'done', 'merged')
+
+    if kind == 'patch':
+        zp, lp = act.get('zip_patch'), act.get('local_patch')
+        if mode == 'ours':
+            return _finish(node, 'done', 'kept local')
+        base_text = _git_show_head(repo_path, rel_file)
+        if zp is None:                       # modified only locally, theirs = revert
+            if mode == 'merge':
+                return _finish(node, 'done', 'kept local (zip has no change)')
+            ctx.backup(local_path)
+            try:
+                git.Repo(repo_path).git.checkout('HEAD', '--', rel_file)
+            except Exception as e:
+                return _finish(node, 'conflict', f'revert failed: {e}')
+            return _finish(node, 'done', 'reverted to HEAD (as in zip)')
+        theirs = _apply_patch_to_text(base_text, zp, rel_file)
+        if theirs is None:
+            return _finish(node, 'conflict', 'zip patch does not apply onto local HEAD')
+        if lp is None or mode == 'theirs':   # take zip side wholesale
+            _write_local(ctx, local_path, theirs)
+            return _finish(node, 'done', 'took zip version')
+        try:
+            ours = open(local_path, encoding='utf-8', errors='replace').read()
+        except OSError:
+            ours = ''
+        merged, n = _merge_texts(ours, base_text, theirs)
+        _write_local(ctx, local_path, merged)
+        if n:
+            return _finish(node, 'conflict', f'{n} conflict(s) — markers written')
+        return _finish(node, 'done', 'merged')
+    return None
+
+
+def apply_subtree(node, mode, ctx):
+    """Apply an action to a node and everything below it. Returns #acted."""
+    count = 0
+    line = apply_action(node, mode, ctx)
+    if line:
+        ctx.log(f"{node['label']}")
+        count += 1
+    for c in node['children']:
+        count += apply_subtree(c, mode, ctx)
+    return count
+
+
+def diff_tree_to_json(root, zip_path, workspace):
+    """Machine-readable dump of the diff tree (for Claude Code and scripts)."""
+    def strip(n):
+        out = {'label': n['label'], 'status': n['status'], 'detail': n['detail']}
+        if n.get('act'):
+            a = dict(n['act'])
+            for k in ('zip_entry', 'local_entry'):
+                if a.get(k) is not None:
+                    a[k] = {'binary': bool(a[k].get('binary')),
+                            'size': len(a[k].get('content', ''))}
+            out['act'] = a
+        if n['children']:
+            out['children'] = [strip(c) for c in n['children']]
+        return out
+    return {'zip': os.path.abspath(zip_path), 'workspace': os.path.abspath(workspace),
+            'tree': strip(root)}
 
 
 def print_state_diff(root, detail=False, _depth=0):
@@ -1525,8 +1771,9 @@ def print_state_diff(root, detail=False, _depth=0):
         print_state_diff(c, detail=detail, _depth=_depth + 1)
 
 
-def run_diff_tui(root):
-    """Curses tree browser: left pane = diff tree, right pane = node detail."""
+def run_diff_tui(root, ctx=None):
+    """Curses tree browser: left pane = diff tree, right pane = node detail.
+    With a _MergeCtx, o/t/m/M apply accept-ours/accept-theirs/merge actions."""
     import curses
 
     def flatten(node, depth=0, out=None):
@@ -1539,7 +1786,7 @@ def run_diff_tui(root):
 
     LEGEND = [('+ only in zip', 'added'), ('- only local', 'removed'),
               ('~ differs', 'changed'), ('= in sync', 'same'),
-              ('▸/▾ expandable', 'info')]
+              ('✓ resolved', 'done'), ('! conflict', 'conflict')]
 
     def draw(stdscr, rows, sel, tree_top, detail_off, colors):
         stdscr.erase()
@@ -1594,13 +1841,23 @@ def run_diff_tui(root):
             except curses.error:
                 pass
             x += len(text) + 3
-        status = ' %d/%d   j/k move  l/Enter expand  h collapse  J/K/PgUp/PgDn detail  g/G  q quit' % (
+        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M merge-all  q quit' % (
             sel + 1, len(rows))
         try:
             stdscr.addnstr(maxy - 1, 0, status.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
         except curses.error:
             pass
         stdscr.refresh()
+
+    def confirm(stdscr, question):
+        maxy, maxx = stdscr.getmaxyx()
+        try:
+            stdscr.addnstr(maxy - 1, 0, (' ' + question + '  [y/N]').ljust(maxx - 1),
+                           maxx - 1, curses.A_REVERSE | curses.A_BOLD)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        return stdscr.getch() in (ord('y'), ord('Y'))
 
     def tui(stdscr):
         curses.curs_set(0)
@@ -1609,10 +1866,12 @@ def run_diff_tui(root):
             curses.use_default_colors()
             for i, (st, col) in enumerate(
                     [('added', curses.COLOR_GREEN), ('removed', curses.COLOR_RED),
-                     ('changed', curses.COLOR_YELLOW), ('info', curses.COLOR_CYAN)], 1):
+                     ('changed', curses.COLOR_YELLOW), ('info', curses.COLOR_CYAN),
+                     ('conflict', curses.COLOR_MAGENTA)], 1):
                 curses.init_pair(i, col, -1)
                 colors[st] = curses.color_pair(i)
             colors['same'] = curses.A_DIM
+            colors['done'] = colors['added'] | curses.A_DIM
         sel, tree_top, detail_off = 0, 0, 0
         while True:
             rows = flatten(root)
@@ -1656,6 +1915,24 @@ def run_diff_tui(root):
                 sel = 0; detail_off = 0
             elif ch == ord('G'):
                 sel = len(rows) - 1; detail_off = 0
+            elif ch == ord('d'):
+                node['detail'] = _merge_preview(node)
+                detail_off = 0
+            elif ch in (ord('o'), ord('t'), ord('m'), ord('M')) and ctx is not None:
+                mode = {ord('o'): 'ours', ord('t'): 'theirs',
+                        ord('m'): 'merge', ord('M'): 'merge'}[ch]
+                target = root if ch == ord('M') else node
+                what = 'EVERYTHING' if ch == ord('M') else target['label'].split('  (')[0]
+                verb = {'ours': 'keep LOCAL side for', 'theirs': 'take ZIP side for',
+                        'merge': '3-way merge'}[mode]
+                if mode == 'ours' or confirm(stdscr, f'{verb} {what}? files will be '
+                                                     f'modified (backup kept)'):
+                    n = apply_subtree(target, mode, ctx)
+                    note = f'{mode}: {n} node(s) resolved'
+                    if ctx.backup_dir:
+                        note += f'   backup: {ctx.backup_dir}'
+                    root['detail'] = [note, ''] + root['detail']
+                detail_off = 0
             elif ch == curses.KEY_RESIZE:
                 pass
 
@@ -1694,6 +1971,9 @@ Examples:
                              'workspace, browsable as a tree (curses TUI on a terminal)')
     parser.add_argument('--no-tui', action='store_true',
                         help='With --diff-state: print the tree instead of the interactive TUI')
+    parser.add_argument('--diff-json', metavar='FILE',
+                        help='With --diff-state: write the diff tree as JSON to FILE '
+                             "('-' for stdout) and exit — machine-readable, e.g. for Claude Code")
     parser.add_argument('--import-state', help='Import workspace from .workspace.zip/.pipeline.zip or .repos file')
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
@@ -1738,12 +2018,20 @@ Examples:
             if workspace is None:
                 workspace = p.get('workspace')
         workspace = workspace or os.getcwd()
-        root = compute_state_diff(os.path.expanduser(args.diff_state), workspace,
-                                  include_paths=include)
-        if args.no_tui or not sys.stdout.isatty():
+        zip_arg = os.path.expanduser(args.diff_state)
+        root = compute_state_diff(zip_arg, workspace, include_paths=include)
+        if args.diff_json:
+            payload = json.dumps(diff_tree_to_json(root, zip_arg, workspace), indent=2)
+            if args.diff_json == '-':
+                print(payload)
+            else:
+                with open(os.path.expanduser(args.diff_json), 'w') as f:
+                    f.write(payload + '\n')
+                print(f"Diff tree written to {args.diff_json}")
+        elif args.no_tui or not sys.stdout.isatty():
             print_state_diff(root, detail=args.debug)
         else:
-            run_diff_tui(root)
+            run_diff_tui(root, ctx=_MergeCtx(workspace))
         exit(0)
 
     # Handle --export-pipeline mode
