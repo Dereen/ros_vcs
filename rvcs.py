@@ -1519,6 +1519,8 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         'legend: + only in zip   - only local   ~ differs   = in sync   ✓ resolved   ! conflict',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
         'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
+        '        after every action the diff RELOADS from disk (r = reload manually);',
+        '        ✓/! marks persist across reloads for this session',
         '        (o/t/m act on the selected node AND everything beneath it;',
         '         originals are backed up under /tmp/rvcs_merge_backup_*)',
     ]
@@ -1538,6 +1540,7 @@ class _MergeCtx:
         self.workspace = workspace
         self.backup_dir = None
         self.results = []
+        self.resolutions = {}   # _node_key -> (status, note): survives reloads
 
     def backup(self, path):
         """Copy a file into the session backup dir before first modification."""
@@ -1736,6 +1739,9 @@ def apply_subtree(node, mode, ctx):
     line = apply_action(node, mode, ctx)
     if line:
         ctx.log(f"{node['label']}")
+        key = _node_key(node)
+        if key:
+            ctx.resolutions[key] = (node['status'], line)
         count += 1
     for c in node['children']:
         count += apply_subtree(c, mode, ctx)
@@ -1771,9 +1777,31 @@ def print_state_diff(root, detail=False, _depth=0):
         print_state_diff(c, detail=detail, _depth=_depth + 1)
 
 
-def run_diff_tui(root, ctx=None):
+def _node_key(node):
+    """Stable identity of an actionable node across tree rebuilds."""
+    act = node.get('act')
+    if not act:
+        return None
+    return (act.get('kind'), act.get('repo'), act.get('file'), act.get('local_path'))
+
+
+def _norm_label(node):
+    return node['label'].split('  (')[0]
+
+
+def _walk_paths(node, prefix=()):
+    """Yield (path_tuple, node) for the whole tree."""
+    path = prefix + (_norm_label(node),)
+    yield path, node
+    for c in node['children']:
+        yield from _walk_paths(c, path)
+
+
+def run_diff_tui(root, ctx=None, rebuild=None):
     """Curses tree browser: left pane = diff tree, right pane = node detail.
-    With a _MergeCtx, o/t/m/M apply accept-ours/accept-theirs/merge actions."""
+    With a _MergeCtx, o/t/m/M apply accept-ours/accept-theirs/merge actions.
+    After every action (and on 'r') the diff is recomputed from disk via
+    rebuild(); resolved/conflict marks are overlaid, expansion + cursor kept."""
     import curses
 
     def flatten(node, depth=0, out=None):
@@ -1843,7 +1871,7 @@ def run_diff_tui(root, ctx=None):
             except curses.error:
                 pass
             x += len(text) + 3
-        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M merge-all  q quit' % (
+        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M all  r reload  q quit' % (
             sel + 1, len(rows))
         try:
             stdscr.addnstr(maxy - 1, 0, status.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
@@ -1861,7 +1889,46 @@ def run_diff_tui(root, ctx=None):
         stdscr.refresh()
         return stdscr.getch() in (ord('y'), ord('Y'))
 
+    def reload_tree(old_root, sel, note):
+        """Recompute the diff from disk; keep expansion, cursor and ✓/! marks."""
+        if rebuild is None:
+            return old_root, sel
+        # remember expansion + the selected node's path
+        expanded = {p for p, n in _walk_paths(old_root) if n['expanded']}
+        sel_path, stack = None, []
+        for i, (n, d) in enumerate(flatten(old_root)):
+            stack = stack[:d] + [_norm_label(n)]
+            if i == sel:
+                sel_path = tuple(stack)
+                break
+        new_root = rebuild()
+        new_root['expanded'] = True
+        for p, n in _walk_paths(new_root):
+            if p in expanded:
+                n['expanded'] = True
+            if ctx is not None:
+                key = _node_key(n)
+                if key and key in ctx.resolutions:
+                    st, txt = ctx.resolutions[key]
+                    n['status'] = st
+                    n['label'] = f"{_norm_label(n)}  ({txt})"
+        new_sel, stack = 0, []
+        rows_new = flatten(new_root)
+        for i, (n, d) in enumerate(rows_new):
+            stack = stack[:d] + [_norm_label(n)]
+            if tuple(stack) == sel_path:
+                new_sel = i
+                break
+        else:
+            new_sel = min(sel, len(rows_new) - 1)
+        extra = [note]
+        if ctx is not None and ctx.backup_dir:
+            extra.append(f'backup: {ctx.backup_dir}')
+        new_root['detail'] = extra + [''] + new_root['detail']
+        return new_root, new_sel
+
     def tui(stdscr):
+        nonlocal root
         curses.curs_set(0)
         colors = {}
         if curses.has_colors():
@@ -1943,7 +2010,11 @@ def run_diff_tui(root, ctx=None):
                     note = f'{mode}: {n} node(s) resolved'
                     if ctx.backup_dir:
                         note += f'   backup: {ctx.backup_dir}'
-                    root['detail'] = [note, ''] + root['detail']
+                    ctx.log(note)
+                    root, sel = reload_tree(root, sel, note)
+                detail_off = 0
+            elif ch == ord('r'):
+                root, sel = reload_tree(root, sel, 'reloaded from disk')
                 detail_off = 0
             elif ch == curses.KEY_RESIZE:
                 pass
@@ -2046,7 +2117,9 @@ Examples:
         elif args.no_tui or not sys.stdout.isatty():
             print_state_diff(root, detail=args.debug)
         else:
-            run_diff_tui(root, ctx=_MergeCtx(workspace))
+            run_diff_tui(root, ctx=_MergeCtx(workspace),
+                         rebuild=lambda: compute_state_diff(zip_arg, workspace,
+                                                            include_paths=include))
         exit(0)
 
     # Handle --export-pipeline mode
