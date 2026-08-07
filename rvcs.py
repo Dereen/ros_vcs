@@ -1364,21 +1364,26 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None):
 
 
 def _repo_commit_info(repo_path, zip_sha):
-    """Describe how local HEAD relates to the zip's recorded commit."""
+    """Describe how local HEAD relates to the zip's recorded commit.
+    Returns (status, detail lines, {'known': bool, 'ahead': int, 'behind': int})."""
     lines, status = [], 'changed'
+    info = {'known': False, 'ahead': 0, 'behind': 0}
     try:
         repo = git.Repo(repo_path)
         local_sha = repo.head.commit.hexsha
         if local_sha == zip_sha:
-            return 'same', []
+            info['known'] = True
+            return 'same', [], info
         try:
             repo.commit(zip_sha)  # is the zip commit known locally?
         except Exception:
             lines.append("zip HEAD %s is NOT in local history — commits made on the "
                          "other machine (check bundles/ in the zip)." % zip_sha[:9])
-            return status, lines
+            return status, lines, info
+        info['known'] = True
         ahead = repo.git.rev_list('--count', f'{zip_sha}..HEAD')
         behind = repo.git.rev_list('--count', f'HEAD..{zip_sha}')
+        info['ahead'], info['behind'] = int(ahead), int(behind)
         lines.append(f"local ahead by {ahead}, behind by {behind} (vs zip {zip_sha[:9]})")
         if int(ahead):
             lines.append('')
@@ -1390,7 +1395,7 @@ def _repo_commit_info(repo_path, zip_sha):
             lines += repo.git.log('--oneline', f'HEAD..{zip_sha}').splitlines()[:20]
     except Exception as e:
         lines.append(f'(could not inspect local repo: {e})')
-    return status, lines
+    return status, lines, info
 
 
 def compute_state_diff(zip_path, workspace, include_paths=None):
@@ -1424,7 +1429,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             repos_sec['children'].append(_node(f"{rel}  (only in zip)", 'added', det))
             continue
         zsha = str(zentry.get('version') or '')
-        cstatus, clines = _repo_commit_info(lpath, zsha)
+        cstatus, clines, cinfo = _repo_commit_info(lpath, zsha)
         zdirty = zm['dirty'].get(rel, {})
         ldirty = get_repo_diff(lpath) or {}
         ldirty = {'staged': ldirty.get('staged_diff', ''),
@@ -1447,6 +1452,20 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             bits.append('changes: +%d -%d ~%d' % (fcounts['+'], fcounts['-'], fcounts['~']))
         n = _node(f"{rel}  ({', '.join(bits)})", 'changed', clines)
         n['children'] = file_nodes
+        bmeta = zm['bundles'].get(rel)
+        if cstatus != 'same' and not cinfo['known'] and bmeta:
+            n['act'] = {'kind': 'bundle', 'repo': lpath,
+                        'zip': os.path.abspath(zip_path),
+                        'member': bmeta['file'], 'zip_sha': zsha}
+            n['detail'] += ['', "t/m on this repo node FETCHES the zip's bundle into the",
+                            'repo (refs only, no working-tree change); the reloaded tree',
+                            'then shows the commits and offers the merge.']
+        elif cinfo['known'] and cinfo['behind']:
+            n['act'] = {'kind': 'commits', 'repo': lpath, 'zip_sha': zsha,
+                        'ahead': cinfo['ahead'], 'behind': cinfo['behind']}
+            how = ('fast-forward' if not cinfo['ahead'] else 'merge commit')
+            n['detail'] += ['', 't/m on this repo node MERGES the zip commits into the local',
+                            f'branch ({how}); undo with git reset --hard ORIG_HEAD.']
         repos_sec['children'].append(n)
 
     local_only = sorted(set(local_repos) - set(zrepos))
@@ -1464,7 +1483,10 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             blines.append(f"{rel}  ({kind})")
         root['children'].append(_node(f"git bundles in zip ({len(zm['bundles'])})", 'info',
                                       ['Commits that exist only on the exporting machine:',
-                                       ''] + blines))
+                                       ''] + blines +
+                                      ['', 'To pull them in: select the repo node above and',
+                                       'press t (fetches the bundle; after the reload, t',
+                                       'again merges the commits).']))
 
     if zm['colcon']:
         member, ztext = zm['colcon']
@@ -1523,6 +1545,8 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         '        ✓/! marks persist across reloads for this session',
         '        (o/t/m act on the selected node AND everything beneath it;',
         '         originals are backed up under /tmp/rvcs_merge_backup_*)',
+        'repos:  on a repo whose commits exist only in the zip, t fetches the',
+        '        bundled commits, then (after reload) t merges them — ff when possible',
     ]
     return root
 
@@ -1614,6 +1638,23 @@ def _merge_texts(ours, base, theirs, label_ours='local', label_theirs='zip'):
 def _merge_preview(node):
     """Detail lines showing what a 3-way merge of this node would produce."""
     act = node.get('act') or {}
+    if act.get('kind') == 'bundle':
+        return ["t fetches the zip's bundle into this repo: refs only, stored",
+                'under refs/rvcs-bundle/ — the working tree is untouched.',
+                'After the automatic reload the incoming commits are listed here',
+                'and t merges them (fast-forward when possible).']
+    if act.get('kind') == 'commits':
+        lines = ['── incoming commits from the zip ──']
+        try:
+            lines += git.Repo(act['repo']).git.log(
+                '--oneline', 'HEAD..' + act['zip_sha']).splitlines()[:30]
+        except Exception as e:
+            lines += [f'(could not list: {e})']
+        lines += ['', ('fast-forward (local has no commits of its own)'
+                       if not act.get('ahead') else
+                       'diverged: t creates a merge commit '
+                       '(%d local vs %d zip commit(s))' % (act['ahead'], act['behind']))]
+        return lines
     if act.get('kind') == 'patch' and act.get('zip_patch') and act.get('local_patch'):
         base = _git_show_head(act['repo'], act['file'])
         theirs = _apply_patch_to_text(base, act['zip_patch'], act['file'])
@@ -1654,6 +1695,75 @@ def _finish(node, status, note):
     return note
 
 
+def _fetch_bundle(node, act):
+    """Fetch the zip's git bundle into the local repo: refs only (under
+    refs/rvcs-bundle/), no working-tree change. After the reload the zip's
+    commits are visible and the repo node offers the merge."""
+    import subprocess
+    repo = act['repo']
+    try:
+        with zipfile.ZipFile(act['zip']) as zf, \
+             tempfile.NamedTemporaryFile(suffix='.bundle') as tf:
+            tf.write(zf.read(act['member']))
+            tf.flush()
+            r = subprocess.run(['git', '-C', repo, 'bundle', 'verify', tf.name],
+                               capture_output=True)
+            if r.returncode != 0:
+                err = r.stderr.decode('utf-8', 'replace').strip().splitlines()
+                return _finish(node, 'conflict',
+                               'bundle verify failed: %s' % (err[-1] if err else '?'))
+            heads = subprocess.run(['git', '-C', repo, 'bundle', 'list-heads', tf.name],
+                                   capture_output=True, check=True).stdout.decode()
+            specs = []
+            for line in heads.splitlines():
+                ref = line.partition(' ')[2].strip()
+                if not ref:
+                    continue
+                if ref.startswith('refs/heads/'):
+                    dest = ref[len('refs/heads/'):]
+                elif ref.startswith('refs/'):
+                    dest = ref[len('refs/'):]
+                else:
+                    dest = ref  # 'HEAD'
+                specs.append('+%s:refs/rvcs-bundle/%s' % (ref, dest))
+            subprocess.run(['git', '-C', repo, 'fetch', '--no-write-fetch-head',
+                            tf.name] + specs, capture_output=True, check=True)
+    except Exception as e:
+        return _finish(node, 'conflict', f'bundle fetch failed: {e}')
+    try:
+        behind = git.Repo(repo).git.rev_list('--count', 'HEAD..' + act['zip_sha'])
+    except Exception:
+        behind = '?'
+    return _finish(node, 'done',
+                   f'bundle fetched: {behind} zip commit(s) now in refs/rvcs-bundle/')
+
+
+def _merge_zip_commits(node, act):
+    """Merge the zip's commits into the local branch. Fast-forward when the
+    local repo is strictly behind; a normal merge commit when diverged. On
+    conflicts the merge is aborted and left to the user."""
+    import subprocess
+    repo, sha = act['repo'], act['zip_sha']
+    ff = not act.get('ahead')
+    args = ['git', '-C', repo, 'merge', '--no-edit'] + \
+           (['--ff-only'] if ff else []) + [sha]
+    r = subprocess.run(args, capture_output=True)
+    if r.returncode == 0:
+        note = ('fast-forwarded to zip HEAD' if ff else
+                'merged %d zip commit(s); undo: git reset --hard ORIG_HEAD'
+                % act.get('behind', 0))
+        return _finish(node, 'done', note)
+    if os.path.exists(os.path.join(repo, '.git', 'MERGE_HEAD')) or \
+       subprocess.run(['git', '-C', repo, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'],
+                      capture_output=True).returncode == 0:
+        subprocess.run(['git', '-C', repo, 'merge', '--abort'], capture_output=True)
+        return _finish(node, 'conflict',
+                       f'merge conflicts — aborted; run git merge {sha[:9]} in the repo')
+    err = (r.stderr or r.stdout).decode('utf-8', 'replace').strip().splitlines()
+    return _finish(node, 'conflict',
+                   'merge failed: %s' % (err[-1] if err else '?'))
+
+
 def apply_action(node, mode, ctx):
     """Apply 'ours'/'theirs'/'merge' to ONE node. Returns a result line or None
     (None = nothing actionable on this node)."""
@@ -1667,6 +1777,16 @@ def apply_action(node, mode, ctx):
             return _finish(node, 'done', 'kept local')
         _write_local(ctx, act['local_path'], act['zip_text'])
         return _finish(node, 'done', 'took zip version')
+
+    if kind == 'bundle':
+        if mode == 'ours':
+            return _finish(node, 'done', 'kept local (bundle not fetched)')
+        return _fetch_bundle(node, act)
+
+    if kind == 'commits':
+        if mode == 'ours':
+            return _finish(node, 'done', 'kept local commits')
+        return _merge_zip_commits(node, act)
 
     repo_path, rel_file = act.get('repo'), act.get('file')
     local_path = os.path.join(repo_path, rel_file) if repo_path else None
@@ -1736,7 +1856,13 @@ def apply_action(node, mode, ctx):
 def apply_subtree(node, mode, ctx):
     """Apply an action to a node and everything below it. Returns #acted."""
     count = 0
-    line = apply_action(node, mode, ctx)
+    try:
+        line = apply_action(node, mode, ctx)
+    except Exception as e:
+        # One unwritable/broken file must not abort a subtree merge: mark the
+        # node and carry on (seen in the wild: files left root-owned by other
+        # tooling -> PermissionError mid-merge).
+        line = _finish(node, 'conflict', f'FAILED: {e}')
     if line:
         ctx.log(f"{node['label']}")
         key = _node_key(node)
