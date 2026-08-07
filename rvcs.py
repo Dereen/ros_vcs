@@ -48,9 +48,12 @@ CLI usage:
 
 import argparse
 import base64
+import glob
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import json
 import yaml
@@ -66,7 +69,13 @@ import git
 from vcstool.commands.export import main as vcs_export
 from vcstool.commands.import_ import main as vcs_import
 
-__version__ = "1.1.0"
+__version__ = "1.4.0"
+
+# Workspace-level colcon configuration, captured on export and restored on
+# import. colcon reads colcon_defaults.yaml from the directory it runs in, so
+# restoring it is what lets a workspace pin its own build settings instead of
+# every importer passing them by hand.
+COLCON_CONFIG_FILES = ('colcon_defaults.yaml', '.colcon/config.yaml')
 
 # Module-level debug flag (set by CLI)
 _debug = False
@@ -608,9 +617,15 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             state_data['dirty_repos'][rel_path] = diff_data
             print(f"  Captured changes for: {rel_path}")
 
-    # Check for .colcon/config.yaml
-    colcon_config_path = os.path.join(workspace_path, '.colcon', 'config.yaml')
-    has_colcon_config = os.path.exists(colcon_config_path)
+    # Workspace-level colcon configuration. Both files live outside every repo,
+    # so nothing else in the export would carry them: colcon_defaults.yaml is
+    # read automatically from the directory colcon runs in, and .colcon/config.yaml
+    # when it is pointed at via COLCON_HOME/COLCON_DEFAULTS_FILE.
+    colcon_files = {}   # arcname -> absolute source path
+    for rel in COLCON_CONFIG_FILES:
+        full = os.path.join(workspace_path, rel)
+        if os.path.isfile(full):
+            colcon_files[rel] = full
 
     # Create zip file
     zip_file = os.path.join(output_dir, f"{ws_name}_{date_str}{zip_suffix}")
@@ -640,10 +655,10 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
             else:
                 zf.write(source, arcname)
 
-        # Add .colcon/config.yaml if it exists
-        if has_colcon_config:
-            zf.write(colcon_config_path, '.colcon/config.yaml')
-            print(f"  Included .colcon/config.yaml")
+        # Workspace colcon configuration
+        for arcname, full in colcon_files.items():
+            zf.write(full, arcname)
+            print(f"  Included {arcname}")
 
     shutil.rmtree(bundle_tmp, ignore_errors=True)
 
@@ -653,7 +668,7 @@ def export_workspace_state(workspace_path, output_dir=None, workspace_name=None,
     print(f"  With uncommitted changes: {dirty_count}")
     if bundles:
         print(f"  Bundled (not on any remote): {len(bundles)}")
-    print(f"  Colcon config: {'included' if has_colcon_config else 'not found'}")
+    print(f"  Colcon config: {', '.join(colcon_files) if colcon_files else 'not found'}")
 
     return zip_file
 
@@ -893,8 +908,235 @@ def report_restored_paths(findings, max_examples=3):
     print("  tracked files. Fix them upstream or adjust them by hand.")
 
 
+_ROSDEP_UNRESOLVED_RE = re.compile(r'^ERROR\[(.+?)\]:\s*Cannot locate rosdep definition for \[(.+?)\]',
+                                   re.MULTILINE)
+# "apt\tros-jazzy-grid-map-core" under "System dependencies have not been satisfied:"
+_ROSDEP_MISSING_RE = re.compile(r'^(apt|pip|pip3|gem|source|npm)\s+(\S+)\s*$', re.MULTILINE)
+
+
+def detect_rosdistro():
+    """ROS distro for rosdep: the sourced one, else the newest under /opt/ros."""
+    distro = os.environ.get('ROS_DISTRO')
+    if distro:
+        return distro
+    try:
+        candidates = sorted(d for d in os.listdir('/opt/ros')
+                            if os.path.isdir(os.path.join('/opt/ros', d)))
+    except OSError:
+        return None
+    return candidates[-1] if candidates else None
+
+
+def _rosdep_source_folder(workspace_path):
+    src = os.path.join(workspace_path, 'src')
+    return src if os.path.isdir(src) else workspace_path
+
+
+def check_system_deps(workspace_path, rosdistro=None):
+    """
+    Ask rosdep what the restored workspace still needs from the system.
+
+    Read-only and sudo-free -- the counterpart to check_restored_paths: report
+    what stands between the import and a successful build, without changing the
+    machine. rosdep is a standalone tool, so no ROS overlay need be sourced;
+    --rosdistro carries what a sourced environment otherwise would.
+
+    Returns {'ok': bool, 'reason': str|None, 'missing': [(installer, pkg)],
+             'unresolved': {package: [rosdep_key]}, 'rosdistro': str|None}
+    """
+    result = {'ok': False, 'reason': None, 'missing': [], 'unresolved': {},
+              'rosdistro': rosdistro}
+    if shutil.which('rosdep') is None:
+        result['reason'] = 'rosdep is not installed'
+        return result
+
+    rosdistro = rosdistro or detect_rosdistro()
+    result['rosdistro'] = rosdistro
+    cmd = ['rosdep', 'check', '--from-paths', _rosdep_source_folder(workspace_path),
+           '--ignore-src']
+    if rosdistro:
+        cmd += ['--rosdistro', rosdistro]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        result['reason'] = f'could not run rosdep: {e}'
+        return result
+
+    output = (proc.stdout or '') + (proc.stderr or '')
+    # rosdep is unusable until `rosdep update` has populated the local cache;
+    # its own error text is cryptic, so say what to do instead of parsing on.
+    if 'rosdep update' in output or 'no sources list' in output.lower():
+        result['reason'] = ('rosdep has no local cache -- run `rosdep update` '
+                            '(and `sudo rosdep init` if never initialised)')
+        return result
+
+    result['ok'] = True
+    for pkg, key in _ROSDEP_UNRESOLVED_RE.findall(output):
+        result['unresolved'].setdefault(pkg, []).append(key)
+    # Only the block after the "not been satisfied" banner lists real installs;
+    # anything before it is diagnostic noise.
+    _, _, tail = output.partition('System dependencies have not been satisfied:')
+    for installer, pkg in _ROSDEP_MISSING_RE.findall(tail):
+        if (installer, pkg) not in result['missing']:
+            result['missing'].append((installer, pkg))
+    return result
+
+
+def report_system_deps(deps):
+    """Print what rosdep found, and the command that would fix the fixable half."""
+    if not deps:
+        return
+    if not deps.get('ok'):
+        if deps.get('reason'):
+            print(f"\nNote: system dependencies not checked -- {deps['reason']}")
+        return
+
+    missing, unresolved = deps.get('missing') or [], deps.get('unresolved') or {}
+    if not missing and not unresolved:
+        print("\nSystem dependencies: all satisfied")
+        return
+
+    if missing:
+        by_installer = {}
+        for installer, pkg in missing:
+            by_installer.setdefault(installer, []).append(pkg)
+        print(f"\nWarning: {len(missing)} system dependency(ies) not installed:")
+        for installer, pkgs in sorted(by_installer.items()):
+            print(f"  [{installer}] {' '.join(sorted(pkgs))}")
+        print("  Install with: rvcs --import-state ... --install-deps")
+        print("  or: rosdep install --from-paths src --ignore-src -r -y")
+
+    if unresolved:
+        # These survive `rosdep install -r`, which prints them and continues --
+        # easy to miss, and usually a bad key in package.xml or a repo the
+        # pipeline definition forgot.
+        total = sum(len(v) for v in unresolved.values())
+        print(f"\nWarning: {total} rosdep key(s) could not be resolved:")
+        for pkg, keys in sorted(unresolved.items()):
+            print(f"  {pkg}: {', '.join(sorted(keys))}")
+        print("  These are unknown to rosdep -- typically a wrong key in the")
+        print("  package's package.xml, or a repo missing from the pipeline.")
+
+
+def install_system_deps(workspace_path, rosdistro=None):
+    """
+    Run `rosdep install` for the workspace. Requires sudo: rosdep shells out to
+    `sudo -H apt-get`, so this is opt-in only and never part of a plain import.
+
+    Output is deliberately not captured, so the sudo password prompt reaches the
+    terminal. Returns True if rosdep exited cleanly.
+    """
+    if shutil.which('rosdep') is None:
+        print("Cannot install dependencies: rosdep is not installed")
+        return False
+    rosdistro = rosdistro or detect_rosdistro()
+    cmd = ['rosdep', 'install', '--from-paths', _rosdep_source_folder(workspace_path),
+           '--ignore-src', '-r', '-y']
+    if rosdistro:
+        cmd += ['--rosdistro', rosdistro]
+    print(f"\nInstalling system dependencies (sudo may prompt):\n  {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  rosdep install failed: {e}")
+        return False
+    if proc.returncode != 0:
+        print(f"  rosdep install exited with code {proc.returncode}")
+        return False
+    return True
+
+
+def _cuda_bin_dir():
+    """
+    Directory holding nvcc, when it exists but is not on PATH.
+
+    CUDA toolkits install under /usr/local/cuda*/bin, which the distro does not
+    add to PATH. A package with a CUDA target then dies at configure time with
+    "No CMAKE_CUDA_COMPILER could be found" even though the compiler is present.
+    Prefers the /usr/local/cuda symlink (points at the chosen toolkit), then the
+    highest-numbered versioned directory.
+    """
+    if shutil.which('nvcc'):
+        return None
+    canonical = '/usr/local/cuda/bin/nvcc'
+    if os.path.isfile(canonical):
+        return os.path.dirname(canonical)
+    for path in sorted(glob.glob('/usr/local/cuda-*/bin/nvcc'), reverse=True):
+        return os.path.dirname(path)
+    return None
+
+
+def build_environment(env_overrides=None):
+    """
+    Environment for the build subprocess.
+
+    Returns (env, notes); notes describe every adjustment so nothing happens
+    invisibly. env_overrides is a list of 'KEY=VALUE' strings, applied last so
+    the caller always wins over the automatic fixes.
+    """
+    env = os.environ.copy()
+    notes = []
+
+    cuda_bin = _cuda_bin_dir()
+    if cuda_bin:
+        env['PATH'] = cuda_bin + os.pathsep + env.get('PATH', '')
+        notes.append(f'PATH += {cuda_bin} (nvcc found but not on PATH)')
+
+    for item in env_overrides or []:
+        key, sep, value = item.partition('=')
+        if not sep or not key:
+            raise ValueError(f"--build-env expects KEY=VALUE, got {item!r}")
+        env[key] = value
+        notes.append(f'{key}={value}')
+    return env, notes
+
+
+def build_workspace(workspace_path, rosdistro=None, build_args=None, env_overrides=None):
+    """
+    Build the restored workspace with colcon.
+
+    colcon resolves ament packages out of the environment, and rvcs runs from
+    its own venv with no ROS overlay sourced -- so the build goes through a
+    shell that sources /opt/ros/<distro>/setup.bash first. Output is left
+    uncaptured: a build is long, and its progress is the point.
+
+    Returns colcon's exit code, or None if it could not be started.
+    """
+    if shutil.which('colcon') is None:
+        print("Cannot build: colcon is not installed")
+        return None
+    rosdistro = rosdistro or detect_rosdistro()
+    setup = f'/opt/ros/{rosdistro}/setup.bash' if rosdistro else None
+    if not setup or not os.path.isfile(setup):
+        print(f"Cannot build: no ROS setup.bash for distro {rosdistro!r}")
+        return None
+
+    argv = ['colcon', 'build', '--symlink-install']
+    if build_args:
+        argv += build_args if isinstance(build_args, list) else shlex.split(build_args)
+    try:
+        env, notes = build_environment(env_overrides)
+    except ValueError as e:
+        print(f"Cannot build: {e}")
+        return None
+    command = f'. {shlex.quote(setup)} && exec {shlex.join(argv)}'
+    print(f"\nBuilding workspace in {workspace_path}:\n  {shlex.join(argv)}")
+    for note in notes:
+        print(f"  env: {note}")
+    try:
+        proc = subprocess.run(['bash', '-c', command], cwd=workspace_path, env=env)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  colcon build failed to start: {e}")
+        return None
+    if proc.returncode != 0:
+        print(f"  colcon build exited with code {proc.returncode} "
+              f"(see {os.path.join(workspace_path, 'log', 'latest_build')})")
+    return proc.returncode
+
+
 def import_workspace_state(input_file, output_dir, state_file=None, install_tmuxinator=False,
-                           rewrite_paths=True):
+                           rewrite_paths=True, install_deps=False, build=False,
+                           build_args=None, build_env=None):
     """
     Import workspace state using vcstool and optionally apply diffs.
 
@@ -911,6 +1153,13 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         install_tmuxinator: Also copy bundled tmuxinator configs to ~/.config/tmuxinator
         rewrite_paths: Rewrite the export-time workspace root out of the pipeline
             payload (tmuxinator configs, pipeline.yaml) so it points at output_dir
+        install_deps: Run `rosdep install` for the restored workspace afterwards.
+            Requires sudo, so it is opt-in; the check itself always runs.
+        build: Run `colcon build` once everything is restored and dependencies
+            are in place (opt-in -- a build is slow and writes build/install/log)
+        build_args: Extra arguments appended to the colcon build command
+            (string or list), e.g. '--cmake-args -DBUILD_TESTING=OFF'
+        build_env: List of 'KEY=VALUE' overrides for the build environment
 
     Returns:
         Dictionary with 'import_return_code', 'patched', 'patch_failed'
@@ -925,7 +1174,7 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     bundle_files = {}   # rel -> extracted .bundle path on disk
     bundle_tmp = None
 
-    colcon_config_content = None
+    colcon_config_content = {}   # arcname -> bytes
     results_paths_rewritten = []   # (member, substitutions), merged into results below
 
     # Handle zip file input
@@ -936,8 +1185,9 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
             if 'workspace.state.yaml' in zf.namelist():
                 state_content = zf.read('workspace.state.yaml').decode('utf-8')
                 state_data = yaml.safe_load(state_content)
-            if '.colcon/config.yaml' in zf.namelist():
-                colcon_config_content = zf.read('.colcon/config.yaml')
+            for rel in COLCON_CONFIG_FILES:
+                if rel in zf.namelist():
+                    colcon_config_content[rel] = zf.read(rel)
             # Extract git bundles for repos that no remote can restore
             for rel, meta in ((state_data or {}).get('bundles') or {}).items():
                 if meta.get('file') in zf.namelist():
@@ -1123,14 +1373,15 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
         for rel in late:
             _restore_bundled_repo(rel)
 
-    # Restore .colcon/config.yaml if it was included
-    if colcon_config_content:
-        colcon_dir = os.path.join(output_dir, '.colcon')
-        os.makedirs(colcon_dir, exist_ok=True)
-        colcon_config_path = os.path.join(colcon_dir, 'config.yaml')
-        with open(colcon_config_path, 'wb') as f:
-            f.write(colcon_config_content)
-        print(f"Restored .colcon/config.yaml")
+    # Restore the workspace colcon configuration. Written before the build so
+    # colcon_defaults.yaml is in place when colcon runs -- that is what makes
+    # --build need no --build-args for a workspace that pins its own settings.
+    for rel, content in colcon_config_content.items():
+        dest = os.path.join(output_dir, rel)
+        os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
+        with open(dest, 'wb') as f:
+            f.write(content)
+        print(f"Restored {rel}")
         results['colcon_config_restored'] = True
 
     # Apply diffs if state data available
@@ -1226,6 +1477,23 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
     # Doctor: what rewriting could not reach (hardcoded paths inside the repos)
     results['path_warnings'] = check_restored_paths(output_dir)
     report_restored_paths(results['path_warnings'])
+
+    # Doctor: what the workspace still needs from the system before it builds
+    deps = check_system_deps(output_dir)
+    if install_deps and deps.get('missing'):
+        if install_system_deps(output_dir, deps.get('rosdistro')):
+            deps = check_system_deps(output_dir)   # re-check so the report is post-install
+    report_system_deps(deps)
+    results['system_deps'] = deps
+
+    # Build last: everything the build needs is now in place, and unmet system
+    # deps are already on screen so a failure here is attributable.
+    if build:
+        if deps.get('ok') and deps.get('missing'):
+            print("\nNote: building with unmet system dependencies "
+                  "(see the warning above) -- expect failures")
+        results['build_return_code'] = build_workspace(
+            output_dir, deps.get('rosdistro'), build_args, build_env)
 
     return results
 
@@ -2206,6 +2474,17 @@ Examples:
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
                         help='With --import-state: copy bundled tmuxinator configs into ~/.config/tmuxinator')
+    parser.add_argument('--build', action='store_true',
+                        help='With --import-state: run colcon build on the restored workspace')
+    parser.add_argument('--build-args',
+                        help='Extra arguments for --build, e.g. '
+                             '"--cmake-args -DBUILD_TESTING=OFF"')
+    parser.add_argument('--build-env', action='append', metavar='KEY=VALUE',
+                        help='Environment override for --build (repeatable). nvcc is '
+                             'added to PATH automatically when installed but not listed')
+    parser.add_argument('--install-deps', action='store_true',
+                        help='With --import-state: run rosdep install for the restored '
+                             'workspace (needs sudo). Missing deps are reported either way')
     parser.add_argument('--no-path-rewrite', action='store_true',
                         help='With --import-state: restore the pipeline payload verbatim instead of '
                              'repointing the export-time workspace root at the import directory')
@@ -2296,7 +2575,10 @@ Examples:
             exit(1)
         import_workspace_state(args.import_state, output_dir, args.state_file,
                                install_tmuxinator=args.install_tmuxinator,
-                               rewrite_paths=not args.no_path_rewrite)
+                               rewrite_paths=not args.no_path_rewrite,
+                               install_deps=args.install_deps,
+                               build=args.build, build_args=args.build_args,
+                               build_env=args.build_env)
         exit(0)
 
     if args.compare and args.json:
