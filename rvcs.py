@@ -71,6 +71,22 @@ __version__ = "1.1.0"
 # Module-level debug flag (set by CLI)
 _debug = False
 
+# Max width for the Package column in the status table. A very long package
+# name (e.g. a deep relative path) otherwise stretches the whole table and
+# wraps onto the next line. Display only — the underlying data (and JSON
+# export) keep the full name.
+MAX_PACKAGE_NAME_WIDTH = 40
+
+
+def truncate_name(text, width=MAX_PACKAGE_NAME_WIDTH):
+    """Truncate a display string to ``width`` chars, marking cuts with '…'."""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[:width - 1] + '…'
+
 
 def load_ignore_packages(ignore_file):
     """Load package names to ignore from a file."""
@@ -2465,7 +2481,8 @@ Examples:
         for i, row in enumerate(results):
             colorized_row = []
             for j, value in enumerate(row):
-                colorized_row.append(f"{colors[i][j]}{value}\033[39m")
+                display = truncate_name(value) if j == 0 else value
+                colorized_row.append(f"{colors[i][j]}{display}\033[39m")
             colorized_results.append(colorized_row)
         print(tabulate(colorized_results, headers=headers, tablefmt="simple"))
 
@@ -2493,7 +2510,8 @@ Examples:
         for i, row in enumerate(results):
             colorized_row = []
             for j, value in enumerate(row):
-                colorized_row.append(f"{colors[i][j]}{value}\033[39m")
+                display = truncate_name(value) if j == 0 else value
+                colorized_row.append(f"{colors[i][j]}{display}\033[39m")
             colorized_results.append(colorized_row)
         print(tabulate(colorized_results, headers=headers, tablefmt="simple"))
 
