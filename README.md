@@ -12,6 +12,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Comparison Mode**: Compare local workspace against a remote snapshot
 - **vcstool Compatible**: Export format is compatible with standard `vcs import` command
 - **Pipelines**: Back up one *slice* of a shared workspace (the repos one line of research uses) together with its tmuxinator session configs
+- **Colcon config**: `colcon_defaults.yaml` / `.colcon/config.yaml` travel with the export, so a workspace pins its own build settings instead of every importer passing them by hand
 - **Git-bundle fallback**: Repos whose HEAD no remote can serve (unpushed commits, no remote, or a configured remote that doesn't exist) are embedded in the zip as git bundles, so exports are restorable without pushing first
 
 ## Installation
@@ -158,6 +159,101 @@ Warning: 62 reference(s) to paths that do not exist on this machine:
       ...
 ```
 
+#### System dependencies
+
+A restored workspace is source only — it still needs whatever its packages
+declare in `package.xml`. Every import ends with a read-only `rosdep check`, so
+what stands between the import and a successful build is visible before you
+invoke colcon:
+
+```
+Warning: 7 system dependency(ies) not installed:
+  [apt] libgoogle-glog-dev ros-jazzy-grid-map-core ros-jazzy-grid-map-ros ...
+  Install with: rvcs --import-state ... --install-deps
+
+Warning: 5 rosdep key(s) could not be resolved:
+  elevation_mapping: pcl
+  marv_xu_hto: marv_flipper_baselines
+  These are unknown to rosdep -- typically a wrong key in the
+  package's package.xml, or a repo missing from the pipeline.
+```
+
+The second group is the easy one to miss: `rosdep install -r` prints those and
+carries on, so an unresolvable key looks like success until the build fails.
+
+`--install-deps` runs the install for you:
+
+```bash
+./rvcs.py --import-state ws.pipeline.zip ~/new_ws --install-deps
+```
+
+It is opt-in because rosdep shells out to `sudo -H apt-get` and will prompt for
+a password — a plain `--import-state` stays non-interactive and never changes
+the machine outside the target directory. rosdep must have been initialised
+(`rosdep init` + `rosdep update`); if its cache is empty, rvcs says so rather
+than failing obscurely. No ROS overlay needs to be sourced — the distro is taken
+from `$ROS_DISTRO`, falling back to what is installed under `/opt/ros`.
+
+#### Building
+
+`--build` runs `colcon build --symlink-install` once everything is restored and
+dependencies are in place, so one command takes a zip to a built workspace:
+
+```bash
+./rvcs.py --import-state ws.pipeline.zip ~/new_ws --install-deps --build
+```
+
+colcon resolves ament packages out of the environment, and rvcs runs from its
+own venv with no ROS overlay sourced — so the build goes through a shell that
+sources `/opt/ros/<distro>/setup.bash` first, with the distro taken from
+`$ROS_DISTRO` or `/opt/ros`.
+
+Extra colcon arguments go through `--build-args`, environment through
+`--build-env` (repeatable):
+
+```bash
+./rvcs.py --import-state ws.pipeline.zip ~/new_ws --build \
+    --build-args "--continue-on-error --cmake-args -DBUILD_TESTING=OFF" \
+    --build-env CMAKE_BUILD_PARALLEL_LEVEL=8
+```
+
+**CUDA**: toolkits install into `/usr/local/cuda*/bin`, which distros do not put
+on `PATH`, so a package with a CUDA target fails at configure time with
+`No CMAKE_CUDA_COMPILER could be found` even though nvcc is installed. rvcs
+detects this and prepends the directory, reporting what it did:
+
+```
+env: PATH += /usr/local/cuda/bin (nvcc found but not on PATH)
+```
+
+Target GPU architecture is not guessed — pass it yourself when a package
+hardcodes one that does not match the local card, e.g.
+`--build-args "--cmake-args -DCMAKE_CUDA_ARCHITECTURES=86"`.
+
+The build is opt-in: it is slow, and it writes `build/`, `install/` and `log/`
+into the target directory.
+
+**Workspace build settings belong in the workspace, not in the command.** colcon
+reads `colcon_defaults.yaml` from the directory it runs in, and exports carry
+that file (along with `.colcon/config.yaml`) — neither lives inside a repo, so
+nothing else in the zip would preserve them. A workspace that pins its own
+settings therefore needs no `--build-args` at all:
+
+```yaml
+# <workspace>/colcon_defaults.yaml
+build:
+  cmake-args:
+    - -DBUILD_TESTING=OFF
+```
+
+```bash
+rvcs --import-state ws.pipeline.zip ~/new_ws --install-deps --build   # no flags
+```
+
+Prefer this over `--build-args` for anything intrinsic to the workspace: it is
+recorded once, travels with every export, and cannot be forgotten on the next
+machine.
+
 ### Diff an export against a live workspace (TUI)
 
 When a collaborator sends their exported state back, browse what changed before
@@ -258,6 +354,10 @@ Color codes:
 | `--import-state FILE` | Import from .workspace.zip, .pipeline.zip or .repos file |
 | `--state-file FILE` | State file with diffs (use with --import-state) |
 | `--install-tmuxinator` | With --import-state: copy bundled tmuxinator configs to ~/.config/tmuxinator |
+| `--install-deps` | With --import-state: run `rosdep install` for the restored workspace (needs sudo) |
+| `--build` | With --import-state: run `colcon build` on the restored workspace |
+| `--build-args ARGS` | Extra arguments for `--build`, e.g. `"--cmake-args -DBUILD_TESTING=OFF"` |
+| `--build-env KEY=VALUE` | Environment override for `--build` (repeatable) |
 | `--no-path-rewrite` | With --import-state: restore the pipeline payload verbatim (skip root rewriting) |
 | `-c, --compare FILE` | Compare with JSON snapshot |
 | `-j, --json` | Export to JSON file |
