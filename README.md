@@ -204,6 +204,26 @@ instead of opening the TUI:
 ./rvcs.py --diff-state export.zip ~/marv_ws --diff-json diff.json  # file
 ```
 
+### Update the workspace from an export (non-conflicting changes only)
+
+The non-interactive companion to the TUI: apply everything that merges
+cleanly, refuse everything that doesn't.
+
+```bash
+./rvcs.py --update-state export.zip ~/marv_ws --dry-run   # report only
+./rvcs.py --update-state export.zip ~/marv_ws             # apply
+```
+
+Zip-side changes are taken via a true 3-way merge (when the zip HEAD contains
+commits unknown locally, the zip's `bundles/` are fetched — objects only — so
+patches apply onto the base they were made against). A file is written only
+when the merge has zero conflicts and actually changes it. Never touched:
+files where the merge would conflict, files already carrying conflict markers,
+locally-tracked files the zip only has as untracked, binary divergence, and
+all local-only changes. Each skip is reported with its reason and a pointer to
+the `--diff-state` TUI; originals of everything written go to
+`/tmp/rvcs_merge_backup_<timestamp>/`.
+
 ### Compare Workspaces
 
 Compare local workspace against a JSON snapshot:

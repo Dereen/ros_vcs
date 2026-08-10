@@ -1885,6 +1885,167 @@ def apply_subtree(node, mode, ctx):
     return count
 
 
+def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=False):
+    """Apply every NON-conflicting change from an export zip to the workspace.
+
+    - zip-side changes are taken via a true 3-way merge: when the zip HEAD
+      contains commits unknown locally, its bundles/ are fetched (objects
+      only) so the patch applies onto the base it was made against
+    - files changed on BOTH sides are written only when the merge is
+      conflict-free; anything conflicting is left untouched and reported
+    - local-only changes are never reverted, nothing is ever deleted
+    Returns (applied, skipped, kept, ctx); dry_run writes nothing.
+    """
+    import subprocess
+    zm = load_state_zip(zip_path)
+    root = compute_state_diff(zip_path, workspace, include_paths)
+    ctx = _MergeCtx(workspace)
+    src = os.path.join(workspace, 'src')
+    if not os.path.isdir(src):
+        src = workspace
+    applied, skipped, kept = [], [], []
+    fetched = {}
+
+    def ensure_sha(repo_rel, repo_path, sha):
+        """Make the zip's commit available locally, fetching its bundle if needed."""
+        ok = subprocess.run(['git', '-C', repo_path, 'cat-file', '-e', sha],
+                            capture_output=True).returncode == 0
+        if ok:
+            return True
+        if repo_rel in fetched:
+            return fetched[repo_rel]
+        got = False
+        meta = zm['bundles'].get(repo_rel)
+        if meta:
+            with zipfile.ZipFile(zip_path) as zf:
+                data = zf.read(meta['file'])
+            bf = tempfile.NamedTemporaryFile(suffix='.bundle', delete=False)
+            try:
+                bf.write(data)
+                bf.close()
+                subprocess.run(['git', '-C', repo_path, 'fetch', bf.name, 'HEAD'],
+                               capture_output=True)
+                got = subprocess.run(['git', '-C', repo_path, 'cat-file', '-e', sha],
+                                     capture_output=True).returncode == 0
+            finally:
+                os.unlink(bf.name)
+        fetched[repo_rel] = got
+        return got
+
+    def show(repo_path, sha, f):
+        r = subprocess.run(['git', '-C', repo_path, 'show', f'{sha}:{f}'],
+                           capture_output=True)
+        return r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else None
+
+    def handle(node):
+        act = node.get('act') or {}
+        kind = act.get('kind')
+        st = node['status']
+        label = _norm_label(node)
+        if kind == 'patch':
+            if st == 'conflict':
+                skipped.append((label, 'unresolved conflict markers in the file'))
+                return
+            if st == 'removed':
+                kept.append(label)
+                return
+            if st in ('same', 'done'):
+                return
+            repo_path, f = act['repo'], act['file']
+            zp = act.get('zip_patch')
+            if zp is None:
+                return
+            repo_rel = os.path.relpath(repo_path, src)
+            his_sha = str((zm['repos'].get(repo_rel) or {}).get('version') or '')
+            his_txt = base_txt = None
+            if his_sha and ensure_sha(repo_rel, repo_path, his_sha):
+                his_txt = show(repo_path, his_sha, f)
+                mb = subprocess.run(['git', '-C', repo_path, 'merge-base', 'HEAD', his_sha],
+                                    capture_output=True, text=True).stdout.strip()
+                base_txt = show(repo_path, mb, f) if mb else None
+            if his_txt is None:
+                his_txt = show(repo_path, 'HEAD', f) or ''
+            if base_txt is None:
+                base_txt = show(repo_path, 'HEAD', f) or ''
+            theirs = _apply_patch_to_text(his_txt, zp, f)
+            if theirs is None:
+                skipped.append((label, 'zip patch does not apply'))
+                return
+            lp = os.path.join(repo_path, f)
+            ours = open(lp, encoding='utf-8', errors='replace').read() \
+                if os.path.exists(lp) else base_txt
+            if ours == theirs:
+                return
+            merged, n = _merge_texts(ours, base_txt, theirs)
+            if n:
+                skipped.append((label, f'{n} conflict(s) — left untouched'))
+                return
+            if merged == ours:
+                return  # their change is already contained in the local file
+            if not dry_run:
+                _write_local(ctx, lp, merged)
+            applied.append(label)
+        elif kind == 'untracked':
+            ze, le = act.get('zip_entry'), act.get('local_entry')
+            if ze is None:
+                kept.append(label)
+                return
+            if st in ('same', 'done'):
+                return
+            lp = os.path.join(act['repo'], act['file'])
+            zb, ztext, _ = _untracked_text(ze)
+            if le is None:
+                if os.path.exists(lp):
+                    # untracked in the zip but TRACKED here (e.g. we committed
+                    # it since their export) — never overwrite silently
+                    try:
+                        same = (open(lp, 'rb').read() ==
+                                (base64.b64decode(ze.get('content', '')) if zb
+                                 else (ztext or '').encode()))
+                    except OSError:
+                        same = False
+                    if not same:
+                        skipped.append((label, 'exists locally (tracked) with '
+                                               'different content'))
+                    return
+                if not dry_run:
+                    if zb:
+                        ctx.backup(lp)
+                        os.makedirs(os.path.dirname(lp) or '/', exist_ok=True)
+                        with open(lp, 'wb') as fh:
+                            fh.write(base64.b64decode(ze.get('content', '')))
+                    else:
+                        _write_local(ctx, lp, ztext or '')
+                applied.append(label)
+                return
+            lb, ltext, _ = _untracked_text(le)
+            if zb or lb:
+                skipped.append((label, 'binary content differs'))
+                return
+            merged, n = _merge_texts(ltext or '', '', ztext or '')
+            if n:
+                skipped.append((label, f'{n} conflict(s) — left untouched'))
+                return
+            if not dry_run:
+                _write_local(ctx, lp, merged)
+            applied.append(label)
+        elif kind == 'plainfile':
+            if st == 'added':
+                if not dry_run:
+                    _write_local(ctx, act['local_path'], act['zip_text'])
+                applied.append(label)
+            elif st == 'changed':
+                skipped.append((label, 'differs — pick a side in the TUI (o/t/m)'))
+
+    def walk(n):
+        handle(n)
+        for c in n['children']:
+            walk(c)
+
+    walk(root)
+    return applied, skipped, kept, ctx
+
+
 def diff_tree_to_json(root, zip_path, workspace):
     """Machine-readable dump of the diff tree (for Claude Code and scripts)."""
     def strip(n):
@@ -2197,6 +2358,12 @@ Examples:
     parser.add_argument('--diff-json', metavar='FILE',
                         help='With --diff-state: write the diff tree as JSON to FILE '
                              "('-' for stdout) and exit — machine-readable, e.g. for Claude Code")
+    parser.add_argument('--update-state', metavar='ZIP',
+                        help='Apply all NON-conflicting changes from an export zip to the '
+                             'workspace (3-way merges; conflicting files are left untouched '
+                             'and reported — resolve those in the --diff-state TUI)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='With --update-state: only report what would be applied')
     parser.add_argument('--import-state', help='Import workspace from .workspace.zip/.pipeline.zip or .repos file')
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
@@ -2227,6 +2394,36 @@ Examples:
         args.export_pipeline = os.path.expanduser(args.export_pipeline)
     if args.pipeline:
         args.pipeline = os.path.expanduser(args.pipeline)
+
+    # Handle --update-state mode
+    if args.update_state:
+        include = None
+        workspace = args.workspace
+        if args.pipeline:
+            p = load_pipeline(os.path.expanduser(args.pipeline))
+            include = p['repos'] or None
+            if workspace is None:
+                workspace = p.get('workspace')
+        workspace = workspace or os.getcwd()
+        applied, skipped, kept, uctx = update_workspace_state(
+            os.path.expanduser(args.update_state), workspace,
+            include_paths=include, dry_run=args.dry_run)
+        verb = 'would apply' if args.dry_run else 'applied'
+        print(f"\n{verb.capitalize()} ({len(applied)}):")
+        for a in applied:
+            print(f"  + {a}")
+        if skipped:
+            print(f"\nSkipped — needs a human ({len(skipped)}):")
+            for s, why in skipped:
+                print(f"  ! {s}: {why}")
+        if kept:
+            print(f"\nLocal-only changes kept as-is: {len(kept)}")
+        if uctx.backup_dir:
+            print(f"\nBackups of every modified file: {uctx.backup_dir}")
+        if skipped:
+            print("Resolve the skipped items interactively: "
+                  f"rvcs --diff-state {args.update_state} {workspace}")
+        exit(0)
 
     # Handle --diff-state mode
     if args.diff_state:
