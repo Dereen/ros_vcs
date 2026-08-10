@@ -1304,6 +1304,17 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None):
         zp, lp = zfiles.get(path), lfiles.get(path)
         act = {'kind': 'patch', 'repo': repo_path, 'file': path,
                'zip_patch': zp, 'local_patch': lp}
+        # A local file still carrying conflict markers (from an earlier merge
+        # of THIS or any tool) is flagged in every session, not just the one
+        # that wrote them.
+        if lp and re.search(r'^\+<{7}[ \n]', lp, re.M):
+            counts['~'] += 1
+            nodes.append(_node(f"{path}  (UNRESOLVED conflict markers in file)", 'conflict',
+                               ['This file contains <<<<<<< / ======= / >>>>>>> markers.',
+                                'Edit it, keep the wanted lines, delete the markers.',
+                                ''] + (lp or '').splitlines()))
+            nodes[-1]['act'] = act
+            continue
         if zp is not None and lp is None:
             counts['+'] += 1
             nodes.append(_node(f"{path}  (modified only in zip)", 'added',
