@@ -2200,9 +2200,68 @@ def _fetch_bundle(node, act):
                    f'bundle fetched: {behind} zip commit(s) now in refs/rvcs-bundle/')
 
 
+def _dirty_preserving_ff(repo, sha):
+    """Fast-forward the branch to sha even though the working tree has local
+    changes git's ff-checkout refuses to touch — PROVIDED every dirty or
+    untracked file among the incoming paths already CONTAINS its incoming
+    change (worktree ⊇ zip side; verified by 3-way merge). The branch and
+    index move to sha, previously-clean files are refreshed, and the local
+    extras simply remain as uncommitted changes on top.
+    Returns (ok, note)."""
+    import subprocess
+
+    def out(*a):
+        return subprocess.run(['git', '-C', repo] + list(a), capture_output=True)
+
+    changed = [l for l in out('diff', '--name-only', 'HEAD', sha)
+               .stdout.decode().splitlines() if l]
+    porcelain = out('status', '--porcelain').stdout.decode().splitlines()
+    dirty = {l[3:].split(' -> ')[-1].strip('"') for l in porcelain}
+    kept, refresh, gone = [], [], []
+    for path in changed:
+        in_zip = out('cat-file', '-e', f'{sha}:{path}').returncode == 0
+        if path not in dirty:
+            (refresh if in_zip else gone).append(path)
+            continue
+        if not in_zip:      # incoming deletes a file we changed — a human call
+            return False, f'{path}: deleted in zip but locally modified'
+        theirs_b = out('cat-file', 'blob', f'{sha}:{path}').stdout
+        try:
+            with open(os.path.join(repo, path), 'rb') as f:
+                ours_b = f.read()
+        except OSError:
+            return False, f'{path}: locally deleted but changed in zip'
+        if ours_b == theirs_b:
+            continue        # identical content, nothing to preserve
+        if b'\0' in ours_b[:8192] or b'\0' in theirs_b[:8192]:
+            return False, f'{path}: binary differs from the zip version'
+        base = _git_show_head(repo, path, rev='HEAD')
+        merged, n = _merge_texts(ours_b.decode('utf-8', 'replace'), base,
+                                 theirs_b.decode('utf-8', 'replace'))
+        if n or merged != ours_b.decode('utf-8', 'replace'):
+            return False, (f'{path}: local changes are not a superset of the '
+                           'zip change')
+        kept.append(path)
+    # every blocker is a superset — move branch + index, leave worktree alone
+    if out('reset', '-q', '--mixed', sha).returncode != 0:
+        return False, 'git reset failed'
+    if refresh:             # bring previously-clean files up to date
+        out('checkout', '--', *refresh)
+    for path in gone:       # files the zip deleted, clean here — remove
+        try:
+            os.unlink(os.path.join(repo, path))
+        except OSError:
+            pass
+    note = 'fast-forwarded to zip HEAD'
+    if kept:
+        note += ' (%d local extra(s) kept uncommitted)' % len(kept)
+    return True, note
+
+
 def _merge_zip_commits(node, act):
     """Merge the zip's commits into the local branch. Fast-forward when the
-    local repo is strictly behind; a normal merge commit when diverged. On
+    local repo is strictly behind (preserving dirty files that already
+    contain the incoming change); a normal merge commit when diverged. On
     conflicts the merge is aborted and left to the user."""
     import subprocess
     repo, sha = act['repo'], act['zip_sha']
@@ -2219,6 +2278,13 @@ def _merge_zip_commits(node, act):
                 'merged %d zip commit(s); undo: git reset --hard ORIG_HEAD'
                 % act.get('behind', 0))
         return _finish(node, 'done', note)
+    if ff:
+        # the usual refusal: dirty/untracked files in the way. If they all
+        # already contain the incoming change, ff without touching them.
+        ok, note = _dirty_preserving_ff(repo, sha)
+        if ok:
+            return _finish(node, 'done', note)
+        return _finish(node, 'conflict', 'ff blocked — ' + note)
     if os.path.exists(os.path.join(repo, '.git', 'MERGE_HEAD')) or \
        subprocess.run(['git', '-C', repo, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'],
                       capture_output=True).returncode == 0:
