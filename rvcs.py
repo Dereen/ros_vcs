@@ -1929,6 +1929,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
         '',
         'legend: + only in zip   - only local   ~ differs   = in sync   ✓ resolved   ! conflict',
+        '        tree colors bubble up: a parent is colored by the WORST status beneath it',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
         'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
     '        u = safe batch update: apply every NON-conflicting zip change',
@@ -1945,6 +1946,24 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
 
 _STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' ',
                  'done': '✓', 'conflict': '!', 'clash': '!'}
+
+# how alarming a status is — parents are COLORED by the worst status found
+# in their subtree so a collapsed node can't hide a purple clash behind
+# an innocent yellow
+_SEVERITY = {'info': 0, 'same': 1, 'done': 2, 'added': 3, 'removed': 3,
+             'changed': 4, 'clash': 5, 'conflict': 6}
+
+
+def _annotate_worst(node):
+    """Store on every node the worst status of its subtree (itself included).
+    Returns that status; the TUI uses it for tree colors."""
+    worst = node['status']
+    for c in node['children']:
+        cs = _annotate_worst(c)
+        if _SEVERITY.get(cs, 0) > _SEVERITY.get(worst, 0):
+            worst = cs
+    node['worst'] = worst
+    return worst
 
 
 # --- merge actions (accept ours / accept theirs / 3-way merge) --------------
@@ -2566,7 +2585,8 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                 mark = '▾' if node['expanded'] else '▸'
             glyph = _STATUS_GLYPH.get(node['status'], ' ')
             text = '%s%s %s %s' % ('  ' * depth, mark, glyph, node['label'])
-            attr = colors.get(node['status'], 0)
+            attr = colors.get(node.get('worst', node['status']),
+                              colors.get(node['status'], 0))
             if idx == sel:
                 attr |= curses.A_REVERSE
             try:
@@ -2665,6 +2685,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                     st, txt = ctx.resolutions[key]
                     n['status'] = st
                     n['label'] = f"{_norm_label(n)}  ({txt})"
+        _annotate_worst(new_root)
         new_sel, stack = 0, []
         rows_new = flatten(new_root)
         for i, (n, d) in enumerate(rows_new):
@@ -2794,6 +2815,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             elif ch == curses.KEY_RESIZE:
                 pass
 
+    _annotate_worst(root)
     try:
         curses.wrapper(tui)
     except KeyboardInterrupt:
