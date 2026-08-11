@@ -2567,7 +2567,7 @@ def _fetch_bundle(node, act):
                    f'bundle fetched: {behind} zip commit(s) now in refs/rvcs-bundle/')
 
 
-def _ff_plan(repo, sha, allow_delete=False):
+def _ff_plan(repo, sha, allow_delete=False, label='zip', delete_hint=None):
     """Work out what fast-forwarding to sha needs, WITHOUT touching anything.
 
     git's ff-checkout refuses whenever a file it must update is dirty. That is
@@ -2575,12 +2575,21 @@ def _ff_plan(repo, sha, allow_delete=False):
     incoming change (worktree ⊇ zip side, verified by 3-way merge) — then the
     branch can move while the worktree keeps the local extras.
 
+    `label` names the incoming side in messages (default 'zip', matching the
+    diff-TUI callers this was written for); `delete_hint` is the sentence
+    telling the human how to confirm dropping a locally-modified file the
+    incoming side deletes, since that's a UI-specific instruction that
+    differs by caller (defaults to the diff-TUI's own wording).
+
     Returns (ok, note, plan). plan = {'refresh', 'gone', 'kept', 'drop'}:
-    refresh = clean files to update, gone = clean files the zip deletes,
-    kept = dirty supersets left alone, drop = DIRTY files the zip deletes
-    (only ever populated with allow_delete=True — deleting local edits needs
-    an explicit decision, so the safe batch update blocks on them instead)."""
+    refresh = clean files to update, gone = clean files the incoming side
+    deletes, kept = dirty supersets left alone, drop = DIRTY files the
+    incoming side deletes (only ever populated with allow_delete=True —
+    deleting local edits needs an explicit decision, so the safe batch
+    update blocks on them instead)."""
     import subprocess
+    if delete_hint is None:
+        delete_hint = 't on the repo node confirms dropping them'
 
     def out(*a):
         return subprocess.run(['git', '-C', repo] + list(a), capture_output=True)
@@ -2603,8 +2612,8 @@ def _ff_plan(repo, sha, allow_delete=False):
                             if p in dirty and os.path.exists(os.path.join(repo, p))
                             and out('cat-file', '-e', f'{sha}:{p}').returncode != 0)
                 return False, ('%d locally-modified file(s) are deleted by the '
-                               'zip commits (e.g. %s) — t on the repo node '
-                               'confirms dropping them' % (n_del, path)), plan
+                               '%s commits (e.g. %s) — %s'
+                               % (n_del, label, path, delete_hint)), plan
             plan['drop'].append(path)
             continue
         theirs_b = out('cat-file', 'blob', f'{sha}:{path}').stdout
@@ -2612,17 +2621,17 @@ def _ff_plan(repo, sha, allow_delete=False):
             with open(os.path.join(repo, path), 'rb') as f:
                 ours_b = f.read()
         except OSError:
-            return False, f'{path}: locally deleted but changed in zip', plan
+            return False, f'{path}: locally deleted but changed in {label}', plan
         if ours_b == theirs_b:
             continue        # identical content, nothing to preserve
         if b'\0' in ours_b[:8192] or b'\0' in theirs_b[:8192]:
-            return False, f'{path}: binary differs from the zip version', plan
+            return False, f'{path}: binary differs from the {label} version', plan
         base = _git_show_head(repo, path, rev='HEAD')
         merged, n = _merge_texts(ours_b.decode('utf-8', 'replace'), base,
                                  theirs_b.decode('utf-8', 'replace'))
         if n or merged != ours_b.decode('utf-8', 'replace'):
             return False, (f'{path}: local changes are not a superset of the '
-                           'zip change'), plan
+                           f'{label} change'), plan
         plan['kept'].append(path)
     note = 'fast-forward possible'
     if plan['kept']:
@@ -2632,15 +2641,18 @@ def _ff_plan(repo, sha, allow_delete=False):
     return True, note, plan
 
 
-def _dirty_preserving_ff(repo, sha, ctx=None, allow_delete=False):
+def _dirty_preserving_ff(repo, sha, ctx=None, allow_delete=False, label='zip',
+                         delete_hint=None):
     """Execute the _ff_plan: move branch+index, refresh clean files, drop the
-    files the zip deletes, leave dirty supersets untouched. (ok, note)."""
+    files the incoming side deletes, leave dirty supersets untouched.
+    `label`/`delete_hint`: see _ff_plan. Returns (ok, note)."""
     import subprocess
 
     def out(*a):
         return subprocess.run(['git', '-C', repo] + list(a), capture_output=True)
 
-    ok, note, plan = _ff_plan(repo, sha, allow_delete=allow_delete)
+    ok, note, plan = _ff_plan(repo, sha, allow_delete=allow_delete, label=label,
+                              delete_hint=delete_hint)
     if not ok:
         return False, note
     for path in plan['drop']:       # back up local edits before removing them
@@ -2655,11 +2667,11 @@ def _dirty_preserving_ff(repo, sha, ctx=None, allow_delete=False):
             os.unlink(os.path.join(repo, path))
         except OSError:
             pass
-    note = 'fast-forwarded to zip HEAD'
+    note = f'fast-forwarded to {label} HEAD'
     if plan['kept']:
         note += ' (%d local extra(s) kept uncommitted)' % len(plan['kept'])
     if plan['drop']:
-        note += ' (%d locally-modified file(s) deleted per the zip)' % len(plan['drop'])
+        note += ' (%d locally-modified file(s) deleted per the %s)' % (len(plan['drop']), label)
     return True, note
 
 
@@ -3623,8 +3635,14 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
         return {'rel': rel, 'status': 'ahead',
                 'note': f'{ahead} local commit(s) not on {upstream_ref} (nothing to pull)',
                 'tmux': None}
-    # strictly behind -- fast-forward, dry_run just reports feasibility
-    ok, plan_note, plan = _ff_plan(repo_path, upstream_ref)
+    # strictly behind -- fast-forward, dry_run just reports feasibility.
+    # label/delete_hint: _ff_plan/_dirty_preserving_ff default to diff-TUI
+    # wording ("zip", "t on the repo node") -- neither applies to a plain
+    # pull, so name the remote and point at the actual next step here.
+    ff_kwargs = dict(label='remote',
+                     delete_hint='re-run with an explicit choice to confirm '
+                                 'dropping them (the safe batch pull never does)')
+    ok, plan_note, plan = _ff_plan(repo_path, upstream_ref, **ff_kwargs)
     if dry_run:
         status = 'pulled' if ok else 'blocked'
         return {'rel': rel, 'status': status,
@@ -3633,7 +3651,7 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
     if not ok:
         return {'rel': rel, 'status': 'blocked', 'note': f'ff blocked -- {plan_note}',
                'tmux': None}
-    done_ok, done_note = _dirty_preserving_ff(repo_path, upstream_ref, ctx=ctx)
+    done_ok, done_note = _dirty_preserving_ff(repo_path, upstream_ref, ctx=ctx, **ff_kwargs)
     if not done_ok:
         return {'rel': rel, 'status': 'blocked', 'note': f'ff failed -- {done_note}',
                'tmux': None}
