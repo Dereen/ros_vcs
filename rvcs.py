@@ -1881,8 +1881,12 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
                             f'branch ({how}); undo with git reset --hard ORIG_HEAD.']
         elif cstatus != 'same' and not cinfo['known'] and not bmeta:
             n['detail'] += ['', 'No bundle for this repo in the zip: the exporter saw these',
-                            "commits on the repo's remote. git fetch in the repo (its ssh",
-                            'key may be needed), then reload with r.']
+                            "commits on the repo's remote. Pull them with:",
+                            '',
+                            f'    git -C {lpath} fetch origin',
+                            '',
+                            '(the repo ssh key may ask for its passphrase), then reload',
+                            'with r — the repo then shows ahead/behind and t/u can merge.']
         repos_sec['children'].append(n)
 
     local_only = sorted(set(local_repos) - set(zrepos))
@@ -2775,10 +2779,10 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             except curses.error:
                 pass
         off = min(len(hdr) + 1, tree_h) if hdr else 0  # +1 blank separator
-        for i in range(tree_h - off):
-            li = detail_off + i
-            if li >= len(detail):
-                break
+        # long detail lines WRAP (hard-sliced, code stays aligned) instead of
+        # being cut at the pane edge; continuations keep the line's color
+        row, li = off, detail_off
+        while row < tree_h and li < len(detail) and dw > 0:
             line = detail[li]
             attr = 0
             if line.startswith(('<<<<<<<', '=======', '>>>>>>>')):
@@ -2789,10 +2793,15 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                 attr = colors.get('removed', 0)
             elif line.startswith('@@') or line.startswith('──'):
                 attr = colors.get('info', 0)
-            try:
-                stdscr.addnstr(i + off, split, line, dw, attr)
-            except curses.error:
-                pass
+            for chunk in [line[i:i + dw] for i in range(0, len(line), dw)] or ['']:
+                if row >= tree_h:
+                    break
+                try:
+                    stdscr.addnstr(row, split, chunk, dw, attr)
+                except curses.error:
+                    pass
+                row += 1
+            li += 1
         x = 1
         for text, st in LEGEND:
             try:
