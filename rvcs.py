@@ -1840,6 +1840,23 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             n['children'] = [c for c in file_nodes]  # identical patches, browsable
             repos_sec['children'].append(n)
             continue
+        # "takeable" = the zip still offers something: file changes to apply
+        # or commits we don't have. Local-ahead commits and local-only file
+        # changes are OUR work — the zip has nothing for us there.
+        takeable = bool(fcounts['+'] or fcounts['~']) \
+            or not cinfo['known'] or bool(cinfo['behind'])
+        if not takeable:
+            summary['='] += 1
+            bits = []
+            if cinfo['ahead']:
+                bits.append(f"local ahead by {cinfo['ahead']}")
+            if fcounts['-']:
+                bits.append(f"{fcounts['-']} local-only change(s)")
+            n = _node(f"{rel}  (nothing to take — {', '.join(bits) or 'local work only'})",
+                      'same', clines)
+            n['children'] = file_nodes
+            repos_sec['children'].append(n)
+            continue
         summary['~'] += 1
         bits = []
         if cstatus != 'same':
@@ -1932,9 +1949,11 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
     in_sync = not summary['+'] and not summary['~'] and not summary['-']
     if in_sync:
         root['status'] = 'done'
-        root['label'] = f"{os.path.basename(zip_path)}  ==  {workspace}  (fully in sync)"
+        root['label'] = (f"{os.path.basename(zip_path)}  ==  {workspace}"
+                         "  (nothing left to take)")
     root['detail'] = ([
-        '✓ WORKSPACE MATCHES THE ZIP — nothing left to take.',
+        '✓ NOTHING LEFT TO TAKE FROM THE ZIP — remaining differences (if any)',
+        '  are local-only work, which is never touched.',
         '',
     ] if in_sync else []) + [
         f"zip:       {zip_path}",
@@ -1966,9 +1985,10 @@ _STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'inf
 
 # how alarming a status is — parents are COLORED by the worst status found
 # in their subtree so a collapsed node can't hide a purple clash behind
-# an innocent yellow
-_SEVERITY = {'info': 0, 'same': 1, 'done': 2, 'added': 3, 'removed': 3,
-             'changed': 4, 'clash': 5, 'conflict': 6}
+# an innocent yellow. Local-only changes ('removed') rank lowest of the
+# non-info states: they ask nothing of the user and never tint a parent.
+_SEVERITY = {'info': 0, 'removed': 1, 'same': 2, 'done': 3, 'added': 4,
+             'changed': 5, 'clash': 6, 'conflict': 7}
 
 
 def _annotate_worst(node):
