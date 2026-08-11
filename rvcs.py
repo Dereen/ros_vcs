@@ -1573,6 +1573,9 @@ def _untracked_text(entry):
     return False, content, len(content)
 
 
+_ZIP_STATE_CACHE = {}  # (repo, file, zip_sha, patch-hash, disk-signature) -> state
+
+
 def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
     """Compare per-file uncommitted changes of one repo between zip and local.
     Returns (child nodes, counts dict). Nodes carry an 'act' payload so the
@@ -1589,24 +1592,38 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
         """How the zip's patch for path relates to the local file:
         'contained' (already in it), 'clean' (3-way merge applies without
         conflicts and brings changes), 'conflict' (3-way merge conflicts),
-        or None when undecidable (zip base commit unknown / patch broken)."""
+        or None when undecidable (zip base commit unknown / patch broken).
+        Memoized on (zip base, patch, local file signature): the result only
+        depends on those, and the check costs 3 subprocesses — without the
+        cache every TUI reload re-pays it for every zip-modified file."""
         if not (repo_path and zip_sha):
             return None
+        lp = os.path.join(repo_path, path)
+        try:
+            st = os.stat(lp)
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+        key = (repo_path, path, zip_sha, hash(zp), sig)
+        if key in _ZIP_STATE_CACHE:
+            return _ZIP_STATE_CACHE[key]
         base = _git_show_head(repo_path, path, rev=zip_sha)
         theirs = _apply_patch_to_text(base, zp, path)
         if theirs is None:
+            _ZIP_STATE_CACHE[key] = None
             return None
         try:
-            ours = open(os.path.join(repo_path, path),
-                        encoding='utf-8', errors='replace').read()
+            ours = open(lp, encoding='utf-8', errors='replace').read()
         except OSError:
             return None
         if ours == theirs:
-            return 'contained'
-        merged, n = _merge_texts(ours, base, theirs)
-        if n:
-            return 'conflict'
-        return 'contained' if merged == ours else 'clean'
+            state = 'contained'
+        else:
+            merged, n = _merge_texts(ours, base, theirs)
+            state = 'conflict' if n else (
+                'contained' if merged == ours else 'clean')
+        _ZIP_STATE_CACHE[key] = state
+        return state
 
     nodes, counts = [], {'+': 0, '-': 0, '~': 0, '=': 0}
     for path in sorted(set(zfiles) | set(lfiles)):
@@ -2662,6 +2679,18 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
         stdscr.refresh()
         return stdscr.getch() in (ord('y'), ord('Y'))
 
+    def busy(stdscr, msg):
+        """Immediate status-line feedback before a slow apply/recompute —
+        without this a confirmed action looks like a dead UI and users
+        press y again (queued keys then leak into the tree)."""
+        maxy, maxx = stdscr.getmaxyx()
+        try:
+            stdscr.addnstr(maxy - 1, 0, (' ⏳ ' + msg).ljust(maxx - 1),
+                           maxx - 1, curses.A_REVERSE | curses.A_BOLD)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
     def reload_tree(old_root, sel, note):
         """Recompute the diff from disk; keep expansion, cursor and ✓/! marks."""
         if rebuild is None:
@@ -2783,20 +2812,24 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                         'merge': '3-way merge'}[mode]
                 if mode == 'ours' or confirm(stdscr, f'{verb} {what}? files will be '
                                                      f'modified (backup kept)'):
+                    busy(stdscr, f'applying {mode} + recomputing diff…')
                     n = apply_subtree(target, mode, ctx)
                     note = f'{mode}: {n} node(s) resolved'
                     if ctx.backup_dir:
                         note += f'   backup: {ctx.backup_dir}'
                     ctx.log(note)
                     root, sel = reload_tree(root, sel, note)
+                    curses.flushinp()  # drop keys typed while the UI was busy
                 detail_off = 0
             elif ch == ord('u') and ctx is not None and updater is not None:
                 if confirm(stdscr, 'apply ALL non-conflicting zip changes? '
                                    'conflicts stay untouched (backup kept)'):
+                    busy(stdscr, 'applying all non-conflicting changes…')
                     try:
                         applied, skipped, kept = updater(ctx)[:3]
                     except Exception as e:
                         root, sel = reload_tree(root, sel, f'update failed: {e}')
+                        curses.flushinp()
                         detail_off = 0
                         continue
                     note = ('update: %d applied, %d skipped (need o/t/m), '
@@ -2808,9 +2841,12 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                     if skipped:
                         root['detail'][1:1] = ['  still needs a human:'] + \
                             ['    ! %s: %s' % s for s in skipped[:15]]
+                    curses.flushinp()
                 detail_off = 0
             elif ch == ord('r'):
+                busy(stdscr, 'recomputing diff from disk…')
                 root, sel = reload_tree(root, sel, 'reloaded from disk')
+                curses.flushinp()
                 detail_off = 0
             elif ch == curses.KEY_RESIZE:
                 pass
