@@ -1825,6 +1825,17 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             continue
         zsha = str(zentry.get('version') or '')
         cstatus, clines, cinfo = _repo_commit_info(lpath, zsha)
+        try:
+            rurl = git.Repo(lpath).git.config('--get', 'remote.origin.url')
+        except Exception:
+            rurl = None
+        url_lines = [f'remote:  {rurl}'] if rurl else []
+        zurl = zentry.get('url')
+        if zurl and zurl != rurl:
+            url_lines.append(f'zip url: {zurl}')
+        if url_lines:
+            url_lines.append('')
+        clines = url_lines + clines
         zdirty = zm['dirty'].get(rel, {})
         ldirty = get_repo_diff(lpath) or {}
         ldirty = {'staged': ldirty.get('staged_diff', ''),
@@ -1836,7 +1847,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         if cstatus == 'same' and not dirty_differs:
             summary['='] += 1
             n = _node(f"{rel}  (in sync)", 'same',
-                      ['HEAD and uncommitted state match the zip.'])
+                      url_lines + ['HEAD and uncommitted state match the zip.'])
             n['children'] = [c for c in file_nodes]  # identical patches, browsable
             repos_sec['children'].append(n)
             continue
