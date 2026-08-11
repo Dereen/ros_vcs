@@ -1635,7 +1635,7 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             elif state == 'conflict':
                 counts['~'] += 1
                 nodes.append(_node(f"{path}  (zip change CONFLICTS with local version)",
-                                   'changed',
+                                   'clash',
                                    ["The zip's patch collides with changes made here since the",
                                     'export — u skips this file. d previews the merge with',
                                     'markers; then m (merge), o (keep local) or t (zip version).',
@@ -1659,10 +1659,12 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
                                     '', '── patch in zip ──'] + zp.splitlines() +
                                    ['', '── patch in local workspace ──'] + lp.splitlines()))
             else:
-                note = ' — merge would conflict' if state == 'conflict' else ''
-                nodes.append(_node(f"{path}  (patches differ{note})", 'changed',
-                                   ['── patch in zip ──'] + zp.splitlines() +
-                                   ['', '── patch in local workspace ──'] + lp.splitlines()))
+                clash = state == 'conflict'
+                nodes.append(_node(
+                    f"{path}  (patches differ{' — merge would conflict' if clash else ''})",
+                    'clash' if clash else 'changed',
+                    ['── patch in zip ──'] + zp.splitlines() +
+                    ['', '── patch in local workspace ──'] + lp.splitlines()))
                 counts['~'] += 1
         else:
             counts['='] += 1
@@ -1703,7 +1705,7 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
                             (ztext or '').splitlines(),
                             'local/' + path, 'zip/' + path, lineterm=''))
                     nodes.append(_node(f"{label_path}  (tracked locally, content differs)",
-                                       'changed', detail))
+                                       'clash', detail))
             else:
                 counts['+'] += 1
                 detail = ['── new file, only in zip ──'] + \
@@ -1942,7 +1944,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
 
 
 _STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' ',
-                 'done': '✓', 'conflict': '!'}
+                 'done': '✓', 'conflict': '!', 'clash': '!'}
 
 
 # --- merge actions (accept ours / accept theirs / 3-way merge) --------------
@@ -2069,6 +2071,18 @@ def _merge_preview(node):
         merged, n = _merge_texts(ltext or '', '', ztext or '')
         return ['── 3-way merge preview (no common base): %d conflict(s) ──' % n,
                 ''] + merged.splitlines()
+    if act.get('kind') == 'untracked' and act.get('zip_entry') and not act.get('local_entry'):
+        zb, ztext, _ = _untracked_text(act['zip_entry'])
+        lp = os.path.join(act['repo'], act['file']) if act.get('repo') else None
+        if lp and os.path.exists(lp) and not zb:
+            try:
+                disk = open(lp, encoding='utf-8', errors='replace').read()
+            except OSError:
+                disk = None
+            if disk is not None:
+                merged, n = _merge_texts(disk, '', ztext or '')
+                return ['── merge preview vs tracked local file (no common base): '
+                        '%d conflict(s) ──' % n, ''] + merged.splitlines()
     return ['(no merge preview for this node — d works on files changed on '
             'BOTH sides)']
 
@@ -2564,9 +2578,27 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                 stdscr.addstr(i, split - 1, '│')
             except curses.error:
                 pass
-        detail = rows[sel][0]['detail'] if sel < len(rows) else []
         dw = maxx - split - 1
-        for i in range(tree_h):
+        sel_node = rows[sel][0] if sel < len(rows) else None
+        detail = sel_node['detail'] if sel_node else []
+        # full label of the selected node as a wrapped, colored header — the
+        # tree pane truncates long labels, the detail pane never should
+        hdr = []
+        if sel_node:
+            import textwrap
+            full = '%s %s' % (_STATUS_GLYPH.get(sel_node['status'], ' '),
+                              sel_node['label'])
+            hdr = textwrap.wrap(full, max(10, dw)) or [full]
+        hdr_attr = (colors.get(sel_node['status'], 0) | curses.A_BOLD) if sel_node else 0
+        for i, line in enumerate(hdr):
+            if i >= tree_h:
+                break
+            try:
+                stdscr.addnstr(i, split, line, dw, hdr_attr)
+            except curses.error:
+                pass
+        off = min(len(hdr) + 1, tree_h) if hdr else 0  # +1 blank separator
+        for i in range(tree_h - off):
             li = detail_off + i
             if li >= len(detail):
                 break
@@ -2581,7 +2613,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             elif line.startswith('@@') or line.startswith('──'):
                 attr = colors.get('info', 0)
             try:
-                stdscr.addnstr(i, split, line, dw, attr)
+                stdscr.addnstr(i + off, split, line, dw, attr)
             except curses.error:
                 pass
         x = 1
@@ -2672,6 +2704,9 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             else:
                 curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_RED)
             colors['confmark'] = curses.color_pair(9)
+            # pre-merge collisions ('would conflict', still actionable via
+            # o/t/m) share the conflict purple so they stand out from ~
+            colors['clash'] = colors.get('conflict', 0)
         sel, tree_top, detail_off = 0, 0, 0
         while True:
             rows = flatten(root)
