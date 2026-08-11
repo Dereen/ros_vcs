@@ -2007,6 +2007,19 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             how = ('fast-forward' if not cinfo['ahead'] else 'merge commit')
             n['detail'] += ['', 't/m on this repo node MERGES the zip commits into the local',
                             f'branch ({how}); undo with git reset --hard ORIG_HEAD.']
+            if not cinfo['ahead']:
+                ok, why, plan = _ff_plan(lpath, zsha)
+                if not ok:
+                    n['detail'] += [
+                        '', 'u (batch update) SKIPS this repo:', f'    {why}',
+                        '', 'Those files are being deleted by the zip commits while you',
+                        'have local edits in them — dropping local edits is an explicit',
+                        'decision, so t (with its confirm) does it and backs the',
+                        'originals up first.']
+                elif plan['kept']:
+                    n['detail'] += ['', 'ff keeps %d locally-modified file(s) uncommitted '
+                                    'on top:' % len(plan['kept'])] + \
+                                   ['    ' + p for p in plan['kept'][:10]]
         elif cstatus != 'same' and not cinfo['known'] and not bmeta:
             n['detail'] += ['', 'No bundle for this repo in the zip: the exporter saw these',
                             "commits on the repo's remote. Pull them with:",
@@ -2359,14 +2372,19 @@ def _fetch_bundle(node, act):
                    f'bundle fetched: {behind} zip commit(s) now in refs/rvcs-bundle/')
 
 
-def _dirty_preserving_ff(repo, sha):
-    """Fast-forward the branch to sha even though the working tree has local
-    changes git's ff-checkout refuses to touch — PROVIDED every dirty or
-    untracked file among the incoming paths already CONTAINS its incoming
-    change (worktree ⊇ zip side; verified by 3-way merge). The branch and
-    index move to sha, previously-clean files are refreshed, and the local
-    extras simply remain as uncommitted changes on top.
-    Returns (ok, note)."""
+def _ff_plan(repo, sha, allow_delete=False):
+    """Work out what fast-forwarding to sha needs, WITHOUT touching anything.
+
+    git's ff-checkout refuses whenever a file it must update is dirty. That is
+    safe to work around only when the local version already CONTAINS the
+    incoming change (worktree ⊇ zip side, verified by 3-way merge) — then the
+    branch can move while the worktree keeps the local extras.
+
+    Returns (ok, note, plan). plan = {'refresh', 'gone', 'kept', 'drop'}:
+    refresh = clean files to update, gone = clean files the zip deletes,
+    kept = dirty supersets left alone, drop = DIRTY files the zip deletes
+    (only ever populated with allow_delete=True — deleting local edits needs
+    an explicit decision, so the safe batch update blocks on them instead)."""
     import subprocess
 
     def out(*a):
@@ -2376,52 +2394,87 @@ def _dirty_preserving_ff(repo, sha):
                .stdout.decode().splitlines() if l]
     porcelain = out('status', '--porcelain').stdout.decode().splitlines()
     dirty = {l[3:].split(' -> ')[-1].strip('"') for l in porcelain}
-    kept, refresh, gone = [], [], []
+    plan = {'refresh': [], 'gone': [], 'kept': [], 'drop': []}
     for path in changed:
         in_zip = out('cat-file', '-e', f'{sha}:{path}').returncode == 0
         if path not in dirty:
-            (refresh if in_zip else gone).append(path)
+            plan['gone' if not in_zip else 'refresh'].append(path)
             continue
-        if not in_zip:      # incoming deletes a file we changed — a human call
-            return False, f'{path}: deleted in zip but locally modified'
+        if not in_zip:      # incoming DELETES a file that is dirty here
+            if not os.path.exists(os.path.join(repo, path)):
+                continue    # deleted on BOTH sides — agreement, nothing to do
+            if not allow_delete:
+                n_del = sum(1 for p in changed
+                            if p in dirty and os.path.exists(os.path.join(repo, p))
+                            and out('cat-file', '-e', f'{sha}:{p}').returncode != 0)
+                return False, ('%d locally-modified file(s) are deleted by the '
+                               'zip commits (e.g. %s) — t on the repo node '
+                               'confirms dropping them' % (n_del, path)), plan
+            plan['drop'].append(path)
+            continue
         theirs_b = out('cat-file', 'blob', f'{sha}:{path}').stdout
         try:
             with open(os.path.join(repo, path), 'rb') as f:
                 ours_b = f.read()
         except OSError:
-            return False, f'{path}: locally deleted but changed in zip'
+            return False, f'{path}: locally deleted but changed in zip', plan
         if ours_b == theirs_b:
             continue        # identical content, nothing to preserve
         if b'\0' in ours_b[:8192] or b'\0' in theirs_b[:8192]:
-            return False, f'{path}: binary differs from the zip version'
+            return False, f'{path}: binary differs from the zip version', plan
         base = _git_show_head(repo, path, rev='HEAD')
         merged, n = _merge_texts(ours_b.decode('utf-8', 'replace'), base,
                                  theirs_b.decode('utf-8', 'replace'))
         if n or merged != ours_b.decode('utf-8', 'replace'):
             return False, (f'{path}: local changes are not a superset of the '
-                           'zip change')
-        kept.append(path)
-    # every blocker is a superset — move branch + index, leave worktree alone
+                           'zip change'), plan
+        plan['kept'].append(path)
+    note = 'fast-forward possible'
+    if plan['kept']:
+        note += ' (%d local extra(s) kept)' % len(plan['kept'])
+    if plan['drop']:
+        note += ' (%d locally-modified file(s) dropped)' % len(plan['drop'])
+    return True, note, plan
+
+
+def _dirty_preserving_ff(repo, sha, ctx=None, allow_delete=False):
+    """Execute the _ff_plan: move branch+index, refresh clean files, drop the
+    files the zip deletes, leave dirty supersets untouched. (ok, note)."""
+    import subprocess
+
+    def out(*a):
+        return subprocess.run(['git', '-C', repo] + list(a), capture_output=True)
+
+    ok, note, plan = _ff_plan(repo, sha, allow_delete=allow_delete)
+    if not ok:
+        return False, note
+    for path in plan['drop']:       # back up local edits before removing them
+        if ctx is not None:
+            ctx.backup(os.path.join(repo, path))
     if out('reset', '-q', '--mixed', sha).returncode != 0:
         return False, 'git reset failed'
-    if refresh:             # bring previously-clean files up to date
-        out('checkout', '--', *refresh)
-    for path in gone:       # files the zip deleted, clean here — remove
+    if plan['refresh']:             # bring previously-clean files up to date
+        out('checkout', '--', *plan['refresh'])
+    for path in plan['gone'] + plan['drop']:
         try:
             os.unlink(os.path.join(repo, path))
         except OSError:
             pass
     note = 'fast-forwarded to zip HEAD'
-    if kept:
-        note += ' (%d local extra(s) kept uncommitted)' % len(kept)
+    if plan['kept']:
+        note += ' (%d local extra(s) kept uncommitted)' % len(plan['kept'])
+    if plan['drop']:
+        note += ' (%d locally-modified file(s) deleted per the zip)' % len(plan['drop'])
     return True, note
 
 
-def _merge_zip_commits(node, act):
+def _merge_zip_commits(node, act, ctx=None, allow_delete=False):
     """Merge the zip's commits into the local branch. Fast-forward when the
     local repo is strictly behind (preserving dirty files that already
     contain the incoming change); a normal merge commit when diverged. On
-    conflicts the merge is aborted and left to the user."""
+    conflicts the merge is aborted and left to the user.
+    allow_delete lets the ff drop locally-modified files the zip deletes —
+    only for explicit per-node actions (t/m), never the batch update."""
     import subprocess
     repo, sha = act['repo'], act['zip_sha']
     ff = not act.get('ahead')
@@ -2440,7 +2493,8 @@ def _merge_zip_commits(node, act):
     if ff:
         # the usual refusal: dirty/untracked files in the way. If they all
         # already contain the incoming change, ff without touching them.
-        ok, note = _dirty_preserving_ff(repo, sha)
+        ok, note = _dirty_preserving_ff(repo, sha, ctx=ctx,
+                                        allow_delete=allow_delete)
         if ok:
             return _finish(node, 'done', note)
         return _finish(node, 'conflict', 'ff blocked — ' + note)
@@ -2477,7 +2531,9 @@ def apply_action(node, mode, ctx):
     if kind == 'commits':
         if mode == 'ours':
             return _finish(node, 'done', 'kept local commits')
-        return _merge_zip_commits(node, act)
+        # explicit per-node action (behind a y/N confirm in the TUI): may drop
+        # locally-modified files the zip deletes, originals backed up first
+        return _merge_zip_commits(node, act, ctx=ctx, allow_delete=True)
 
     repo_path, rel_file = act.get('repo'), act.get('file')
     local_path = os.path.join(repo_path, rel_file) if repo_path else None
@@ -2765,9 +2821,16 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
                 skipped.append((label, 'diverged — merge from the repo node (t)'))
                 return
             if dry_run:
-                applied.append(f"{label}: fast-forward {act.get('behind')} commit(s)")
+                # probe for real: a dirty worktree can block the ff, and
+                # claiming 'would apply' for something u then refuses is worse
+                # than saying nothing
+                ok, why, _plan = _ff_plan(act['repo'], act['zip_sha'])
+                if ok:
+                    applied.append(f"{label}: fast-forward {act.get('behind')} commit(s)")
+                else:
+                    skipped.append((label, f'ff blocked — {why}'))
                 return
-            note = _merge_zip_commits(node, act)
+            note = _merge_zip_commits(node, act, ctx=ctx)
             if node['status'] == 'done':
                 applied.append(f"{label}: {note}")
             else:
@@ -2801,7 +2864,8 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
             node['status'] = 'changed'   # let the second action run
             note = _merge_zip_commits(node, {'repo': act['repo'],
                                              'zip_sha': act['zip_sha'],
-                                             'ahead': 0, 'behind': behind})
+                                             'ahead': 0, 'behind': behind},
+                                      ctx=ctx)
             if node['status'] == 'done':
                 applied.append(f"{label}: {note}")
             else:
