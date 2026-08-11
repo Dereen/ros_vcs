@@ -1761,6 +1761,10 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             how = ('fast-forward' if not cinfo['ahead'] else 'merge commit')
             n['detail'] += ['', 't/m on this repo node MERGES the zip commits into the local',
                             f'branch ({how}); undo with git reset --hard ORIG_HEAD.']
+        elif cstatus != 'same' and not cinfo['known'] and not bmeta:
+            n['detail'] += ['', 'No bundle for this repo in the zip: the exporter saw these',
+                            "commits on the repo's remote. git fetch in the repo (its ssh",
+                            'key may be needed), then reload with r.']
         repos_sec['children'].append(n)
 
     local_only = sorted(set(local_repos) - set(zrepos))
@@ -2040,7 +2044,11 @@ def _merge_zip_commits(node, act):
     import subprocess
     repo, sha = act['repo'], act['zip_sha']
     ff = not act.get('ahead')
-    args = ['git', '-C', repo, 'merge', '--no-edit'] + \
+    ident = []
+    if not subprocess.run(['git', '-C', repo, 'config', 'user.email'],
+                          capture_output=True).stdout.strip():
+        ident = ['-c', 'user.name=rvcs', '-c', 'user.email=rvcs@localhost']
+    args = ['git'] + ident + ['-C', repo, 'merge', '--no-edit'] + \
            (['--ff-only'] if ff else []) + [sha]
     r = subprocess.run(args, capture_output=True)
     if r.returncode == 0:
