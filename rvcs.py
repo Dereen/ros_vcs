@@ -82,6 +82,11 @@ COLCON_CONFIG_FILES = ('colcon_defaults.yaml', '.colcon/config.yaml')
 # particular output_dir: a pipeline definition describes a slice of a
 # workspace, and belongs in one place regardless of which workspace an
 # import lands in.
+#
+# Layout: PIPELINE_CONFIG_DIR/<name>/<name>.pipeline.yaml, each <name>/ its
+# OWN git repo (not one shared repo) — so each pipeline's history is its own
+# clean log, distinguishable at the filesystem level (ls PIPELINE_CONFIG_DIR
+# already lists every known pipeline), and diffable/mergeable independently.
 PIPELINE_CONFIG_DIR = os.path.expanduser('~/.config/ros_vcs/pipeline')
 
 # Module-level debug flag (set by CLI)
@@ -153,6 +158,113 @@ def load_pipeline(pipeline_file):
         data['workspace'] = os.path.expanduser(data['workspace'])
     data['tmuxinator'] = [os.path.expanduser(p) for p in data['tmuxinator']]
     return data
+
+
+def _pipeline_repo_dir(name):
+    return os.path.join(PIPELINE_CONFIG_DIR, name)
+
+
+def _pipeline_file_in_repo(name):
+    return os.path.join(_pipeline_repo_dir(name), f'{name}.pipeline.yaml')
+
+
+def list_pipeline_names():
+    """Names of every pipeline in the canonical store — one git repo per
+    name under PIPELINE_CONFIG_DIR. Directories without a .git (or without
+    their own <name>.pipeline.yaml) are not pipelines; skipped rather than
+    erroring, so stray files don't break listing."""
+    if not os.path.isdir(PIPELINE_CONFIG_DIR):
+        return []
+    names = []
+    for n in sorted(os.listdir(PIPELINE_CONFIG_DIR)):
+        d = _pipeline_repo_dir(n)
+        if os.path.isdir(os.path.join(d, '.git')) and os.path.isfile(_pipeline_file_in_repo(n)):
+            names.append(n)
+    return names
+
+
+def _git_identity_args(repo_dir):
+    """[] if the repo (or global config) already has a committer identity,
+    else -c overrides for a neutral one — same fallback _merge_zip_commits
+    uses, so unattended commits (import, this store) never fail on a bare
+    'cnuc'-style environment with no configured git identity."""
+    import subprocess
+    if subprocess.run(['git', '-C', repo_dir, 'config', 'user.email'],
+                      capture_output=True).stdout.strip():
+        return []
+    return ['-c', 'user.name=rvcs', '-c', 'user.email=rvcs@localhost']
+
+
+def pipeline_source_path(name):
+    """Resolve a pipeline NAME (not a path) to a real file path holding its
+    LATEST COMMITTED definition — read via `git show HEAD:...`, so an
+    uncommitted edit sitting in the store's working tree is never used as
+    the canonical content; only what's actually been committed counts.
+    Written to a temp file (real path, for load_pipeline/open() callers) and
+    returned. Raises FileNotFoundError with the list of known names if there
+    is no such pipeline."""
+    import subprocess
+    repo_dir = _pipeline_repo_dir(name)
+    if not os.path.isdir(os.path.join(repo_dir, '.git')):
+        known = list_pipeline_names()
+        hint = ('Known pipelines: ' + ', '.join(known)) if known else \
+               f'No pipelines stored yet under {PIPELINE_CONFIG_DIR}.'
+        raise FileNotFoundError(f"No pipeline named '{name}' and no such file. {hint}")
+    r = subprocess.run(['git', '-C', repo_dir, 'show', f'HEAD:{name}.pipeline.yaml'],
+                       capture_output=True)
+    if r.returncode != 0:
+        raise FileNotFoundError(
+            f"pipeline '{name}': could not read the latest commit "
+            f"({r.stderr.decode('utf-8', 'replace').strip()})")
+    tmp_dir = tempfile.mkdtemp(prefix='rvcs_pipeline_')
+    tmp_path = os.path.join(tmp_dir, f'{name}.pipeline.yaml')
+    with open(tmp_path, 'wb') as f:
+        f.write(r.stdout)
+    return tmp_path
+
+
+def resolve_pipeline_arg(value):
+    """A --pipeline/--export-pipeline argument (or the bare-name CLI
+    shortcut) is either a real path or a pipeline NAME to resolve against
+    the canonical store. Paths win: if it exists on disk, or looks like one
+    (has a path separator or a .yaml/.yml suffix), it's used as-is —
+    resolution only kicks in for bare tokens that are neither."""
+    if os.path.exists(value) or os.sep in value or value.endswith(('.yaml', '.yml')):
+        return value
+    return pipeline_source_path(value)
+
+
+def commit_pipeline_snapshot(name, content_bytes, message, author_date=None):
+    """Write content_bytes as <name>.pipeline.yaml into its own canonical
+    repo (created on first use), and commit if it actually changed anything
+    — this is the versioning step: every import of a pipeline zip becomes
+    one commit in that pipeline's own history. author_date (a
+    'YYYY-MM-DDTHH:MM:SS' string) backdates the commit to when the snapshot
+    was actually exported, not when it happened to be imported; None uses
+    now. Returns the short commit hash, or None if nothing changed."""
+    import subprocess
+    repo_dir = _pipeline_repo_dir(name)
+    dest = _pipeline_file_in_repo(name)
+    os.makedirs(repo_dir, exist_ok=True)
+    if not os.path.isdir(os.path.join(repo_dir, '.git')):
+        subprocess.run(['git', 'init', '-q', '-b', 'main', repo_dir], check=True)
+    with open(dest, 'wb') as f:
+        f.write(content_bytes)
+    ident = _git_identity_args(repo_dir)
+    subprocess.run(['git', '-C', repo_dir, 'add', f'{name}.pipeline.yaml'], check=True)
+    if subprocess.run(['git', '-C', repo_dir, 'diff', '--cached', '--quiet']).returncode == 0:
+        return None   # identical to HEAD (or an empty repo with nothing staged) -- no-op
+    env = dict(os.environ)
+    if author_date:
+        env['GIT_AUTHOR_DATE'] = author_date
+        env['GIT_COMMITTER_DATE'] = author_date
+    r = subprocess.run(['git'] + ident + ['-C', repo_dir, 'commit', '-q', '-m', message],
+                       env=env, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"commit failed for pipeline '{name}': "
+                           f"{r.stderr.decode('utf-8', 'replace').strip()}")
+    return subprocess.run(['git', '-C', repo_dir, 'rev-parse', '--short', 'HEAD'],
+                          capture_output=True, text=True).stdout.strip()
 
 
 def repo_in_include_paths(rel_path, include_paths):
@@ -1157,10 +1269,11 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
       tmuxinator/* -> <output_dir>/tmuxinator/ (and, with install_tmuxinator,
                       copied into ~/.config/tmuxinator/)
       extra/*      -> <output_dir>/ (workspace-relative non-repo paths)
-      pipeline/*   -> PIPELINE_CONFIG_DIR (~/.config/ros_vcs/pipeline/,
-                      workspace-independent, always installed; older zips
-                      carrying a bare 'pipeline.yaml' member land there too,
-                      under a name recovered from the definition's own key)
+      pipeline/*   -> VERSIONED into PIPELINE_CONFIG_DIR/<name>/ (its own
+                      git repo, one commit per import, backdated to the
+                      export's own timestamp); older zips carrying a bare
+                      'pipeline.yaml' member version there too, under a
+                      name recovered from the definition's own 'name:' key
 
     Args:
         input_file: Path to .workspace.zip/.pipeline.zip, .repos file, or directory
@@ -1262,12 +1375,12 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
 
                 # Restore pipeline payload. extra/<rel> entries land at their
                 # workspace-relative path; tmuxinator configs land in
-                # <output_dir>/tmuxinator/. Pipeline definitions go straight
-                # to the canonical, workspace-independent PIPELINE_CONFIG_DIR
-                # (like --install-tmuxinator's ~/.config/tmuxinator/ copy,
-                # but unconditional: a pipeline definition has exactly one
-                # home, not a workspace-local staging copy plus an optional
-                # install).
+                # <output_dir>/tmuxinator/. Pipeline definitions VERSION into
+                # their own canonical repo under PIPELINE_CONFIG_DIR — every
+                # import of a pipeline zip is one commit in that pipeline's
+                # history, backdated to when it was actually exported.
+                export_date = (state_data or {}).get('export_date')
+                pipe_files = []
                 for member in pipeline_members:
                     if member.endswith('/'):
                         continue
@@ -1278,28 +1391,66 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                         # Pre-canonical-directory zip: a bare 'pipeline.yaml'
                         # member carries no real filename. Recover one from
                         # the pipeline's own required 'name:' key so it still
-                        # lands under a meaningful name, not a generic one.
+                        # versions under a meaningful name, not a generic one.
+                        # The store gets the RAW exported bytes, not the
+                        # path-rewritten copy: the canonical version is what
+                        # the exporter authored, so re-importing the same zip
+                        # (into any directory) is a no-op, not a phantom
+                        # 'workspace: changed' version.
+                        raw = zf.read(member)
                         pname = None
                         try:
-                            doc = yaml.safe_load(content.decode('utf-8'))
+                            doc = yaml.safe_load(raw.decode('utf-8'))
                             if isinstance(doc, dict):
                                 pname = doc.get('name')
                         except Exception:
                             pass
-                        fname = f"{pname}.pipeline.yaml" if pname else 'pipeline.yaml'
-                        dest = os.path.join(PIPELINE_CONFIG_DIR, fname)
+                        if pname:
+                            pipe_files.append((pname, raw))
+                        continue
                     elif member.startswith('pipeline/'):
-                        dest = os.path.join(PIPELINE_CONFIG_DIR,
-                                            os.path.relpath(member, 'pipeline'))
+                        pname = os.path.basename(member)
+                        for suf in ('.pipeline.yaml', '.pipeline.yml'):
+                            if pname.endswith(suf):
+                                pname = pname[:-len(suf)]
+                                break
+                        pipe_files.append((pname, zf.read(member)))
+                        continue
                     else:
                         dest = os.path.join(output_dir, member)
                     os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
                     with open(dest, 'wb') as out:
                         out.write(content)
-                pipe_files = [n for n in pipeline_members
-                             if n == 'pipeline.yaml' or n.startswith('pipeline/')]
-                if pipe_files:
-                    print(f"  Restored pipeline definition to {PIPELINE_CONFIG_DIR}/")
+                for pname, content in pipe_files:
+                    author_date = None
+                    if export_date:
+                        try:
+                            author_date = datetime.strptime(
+                                export_date, '%Y-%m-%d_%H-%M-%S').strftime('%Y-%m-%dT%H:%M:%S')
+                        except ValueError:
+                            pass
+                    sha = commit_pipeline_snapshot(
+                        pname, content,
+                        f"import: {pname} pipeline snapshot"
+                        + (f" ({export_date})" if export_date else "")
+                        + f"\n\nFrom {os.path.basename(input_file)}.",
+                        author_date=author_date)
+                    print(f"  Pipeline '{pname}': "
+                          f"{'committed ' + sha if sha else 'unchanged (identical to HEAD)'} "
+                          f"in {_pipeline_repo_dir(pname)}/")
+                    if sha:
+                        # show what this snapshot changed vs the previous one
+                        import subprocess
+                        d = subprocess.run(
+                            ['git', '-C', _pipeline_repo_dir(pname), 'show',
+                             '--format=', '--unified=2', 'HEAD'],
+                            capture_output=True, text=True).stdout.splitlines()
+                        if d:
+                            shown = d[:80]
+                            print('    ' + '\n    '.join(shown))
+                            if len(d) > len(shown):
+                                print(f'    … {len(d) - len(shown)} more diff line(s) — '
+                                      f'git -C {_pipeline_repo_dir(pname)} show')
                 tmux_files = [n for n in pipeline_members if n.startswith('tmuxinator/')]
                 if tmux_files:
                     print(f"  Restored tmuxinator configs to {os.path.join(output_dir, 'tmuxinator')}/")
@@ -3295,6 +3446,9 @@ Examples:
   rvcs --export-pipeline p.pipeline.yaml
                                     Export a pipeline's repos + tmuxinator configs
   rvcs --pipeline p.pipeline.yaml   Status of only the pipeline's repos
+  rvcs --list-pipelines             Stored pipelines (~/.config/ros_vcs/pipeline)
+  rvcs flipper_eval                 Same as --pipeline flipper_eval (stored NAME;
+                                    workspace comes from the definition itself)
         """
     )
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
@@ -3302,10 +3456,16 @@ Examples:
     parser.add_argument('-j', '--json', action='store_true', help='Save results to JSON file')
     parser.add_argument('-c', '--compare', help='Compare with JSON file')
     parser.add_argument('--export-state', action='store_true', help='Export workspace state to zip')
-    parser.add_argument('--export-pipeline', metavar='PIPELINE_FILE',
-                        help='Export a pipeline slice (.pipeline.yaml) incl. tmuxinator configs')
-    parser.add_argument('--pipeline', metavar='PIPELINE_FILE',
-                        help='Restrict status/compare to the repos of a pipeline definition')
+    parser.add_argument('--export-pipeline', metavar='PIPELINE',
+                        help='Export a pipeline slice incl. tmuxinator configs — a '
+                             '.pipeline.yaml path, or a stored pipeline NAME '
+                             '(see --list-pipelines)')
+    parser.add_argument('--pipeline', metavar='PIPELINE',
+                        help='Restrict status/compare to the repos of a pipeline — a '
+                             '.pipeline.yaml path, or a stored pipeline NAME')
+    parser.add_argument('--list-pipelines', action='store_true',
+                        help='List pipelines stored under ~/.config/ros_vcs/pipeline '
+                             '(each in its own git repo, one commit per imported snapshot)')
     parser.add_argument('--diff-state', metavar='ZIP',
                         help='Diff an exported .workspace.zip/.pipeline.zip against a live '
                              'workspace, browsable as a tree (curses TUI on a terminal)')
@@ -3357,10 +3517,54 @@ Examples:
         args.state_file = os.path.expanduser(args.state_file)
     if args.ignore:
         args.ignore = os.path.expanduser(args.ignore)
-    if args.export_pipeline:
-        args.export_pipeline = os.path.expanduser(args.export_pipeline)
-    if args.pipeline:
-        args.pipeline = os.path.expanduser(args.pipeline)
+    # --list-pipelines: enumerate the canonical store, newest activity first
+    if args.list_pipelines:
+        import subprocess
+        names = list_pipeline_names()
+        if not names:
+            print(f"No pipelines stored under {PIPELINE_CONFIG_DIR}")
+            exit(0)
+        print(f"Pipelines in {PIPELINE_CONFIG_DIR} (each its own git repo):\n")
+        for n in names:
+            d = _pipeline_repo_dir(n)
+            last = subprocess.run(
+                ['git', '-C', d, 'log', '-1',
+                 '--format=%h  %ad  %s', '--date=format:%Y-%m-%d %H:%M'],
+                capture_output=True, text=True).stdout.strip()
+            count = subprocess.run(['git', '-C', d, 'rev-list', '--count', 'HEAD'],
+                                   capture_output=True, text=True).stdout.strip()
+            ws = ''
+            try:
+                ws = load_pipeline(_pipeline_file_in_repo(n)).get('workspace') or ''
+            except Exception:
+                pass
+            print(f"  {n}   ({count} version(s)" + (f", workspace {ws}" if ws else '') + ')')
+            print(f"      {last}")
+        print(f"\nUse a NAME directly:  rvcs <name>   rvcs --pipeline <name> ...   "
+              f"rvcs --export-pipeline <name>")
+        exit(0)
+
+    # --pipeline/--export-pipeline accept a stored NAME as well as a path
+    try:
+        if args.export_pipeline:
+            args.export_pipeline = resolve_pipeline_arg(
+                os.path.expanduser(args.export_pipeline))
+        if args.pipeline:
+            args.pipeline = resolve_pipeline_arg(os.path.expanduser(args.pipeline))
+    except FileNotFoundError as e:
+        print(e)
+        exit(1)
+
+    # Bare-name shortcut: `rvcs flipper_eval [...]` == `--pipeline flipper_eval`
+    # (workspace then comes from the definition's own 'workspace:' key). Only
+    # for a token with no path separator that is not an existing directory and
+    # matches a stored pipeline — and never for --import-state, whose
+    # positional is an output directory that may not exist yet.
+    if args.workspace and not args.import_state and not args.pipeline \
+            and os.sep not in args.workspace and not os.path.isdir(args.workspace) \
+            and args.workspace in list_pipeline_names():
+        args.pipeline = pipeline_source_path(args.workspace)
+        args.workspace = None
 
     # Handle --update-state mode
     if args.update_state:

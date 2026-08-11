@@ -120,12 +120,27 @@ Status of only the pipeline's repos:
 ./rvcs.py --pipeline overhang.pipeline.yaml
 ```
 
-Import works with the standard command; the pipeline definition is restored to the
-canonical `~/.config/ros_vcs/pipeline/` directory — always, not tied to any one
-workspace, the same role `~/.config/tmuxinator/` plays for session configs (multiple
-pipelines coexist there under their own filenames). Tmuxinator configs are restored to
-`<workspace>/tmuxinator/` (add `--install-tmuxinator` to also copy them into
-`~/.config/tmuxinator/`), and `extra_paths` are restored to their original
+Stored pipelines can be used by NAME anywhere a definition path is accepted —
+resolution reads the latest **committed** version from the store (never a dirty
+working-tree edit):
+
+```bash
+./rvcs.py --list-pipelines            # what's in ~/.config/ros_vcs/pipeline
+./rvcs.py flipper_eval                # status of that pipeline's repos
+                                      # (workspace from the definition itself)
+./rvcs.py --pipeline flipper_eval --diff-state export.zip
+./rvcs.py --export-pipeline flipper_eval
+```
+
+Import works with the standard command; the pipeline definition is **versioned** into
+the canonical store `~/.config/ros_vcs/pipeline/<name>/` — each pipeline its OWN git
+repo, so histories stay separate and `ls` of the store lists every known pipeline.
+Every import commits one snapshot (backdated to the zip's export timestamp and shown
+as a diff against the previous version); re-importing an identical snapshot is a
+no-op. The store holds the exporter's authored content, not the path-rewritten copy,
+so the same zip imported anywhere versions identically. Tmuxinator configs are
+restored to `<workspace>/tmuxinator/` (add `--install-tmuxinator` to also copy them
+into `~/.config/tmuxinator/`), and `extra_paths` are restored to their original
 workspace-relative locations:
 
 ```bash
