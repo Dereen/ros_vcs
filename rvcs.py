@@ -1828,7 +1828,14 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         root['children'][-1]['act'] = tact
 
     src = zm['name'] or '?'
-    root['detail'] = [
+    in_sync = not summary['+'] and not summary['~'] and not summary['-']
+    if in_sync:
+        root['status'] = 'done'
+        root['label'] = f"{os.path.basename(zip_path)}  ==  {workspace}  (fully in sync)"
+    root['detail'] = ([
+        '✓ WORKSPACE MATCHES THE ZIP — nothing left to take.',
+        '',
+    ] if in_sync else []) + [
         f"zip:       {zip_path}",
         f"exported:  {src}  @  {zm['date'] or '?'}",
         f"workspace: {workspace}",
@@ -2203,6 +2210,14 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
     applied, skipped, kept = [], [], []
     fetched = {}
 
+    def mark(node):
+        """Remember an applied node in the ctx so the TUI paints it ✓ across
+        reloads (keys are stable between tree rebuilds)."""
+        if not dry_run:
+            key = _node_key(node)
+            if key:
+                ctx.resolutions[key] = ('done', 'applied by update')
+
     def ensure_sha(repo_rel, repo_path, sha):
         """Make the zip's commit available locally, fetching its bundle if needed."""
         ok = subprocess.run(['git', '-C', repo_path, 'cat-file', '-e', sha],
@@ -2281,6 +2296,7 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
                 return  # their change is already contained in the local file
             if not dry_run:
                 _write_local(ctx, lp, merged)
+            mark(node)
             applied.append(label)
         elif kind == 'untracked':
             ze, le = act.get('zip_entry'), act.get('local_entry')
@@ -2313,6 +2329,7 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
                             fh.write(base64.b64decode(ze.get('content', '')))
                     else:
                         _write_local(ctx, lp, ztext or '')
+                mark(node)
                 applied.append(label)
                 return
             lb, ltext, _ = _untracked_text(le)
@@ -2325,11 +2342,13 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
                 return
             if not dry_run:
                 _write_local(ctx, lp, merged)
+            mark(node)
             applied.append(label)
         elif kind == 'plainfile':
             if st == 'added':
                 if not dry_run:
                     _write_local(ctx, act['local_path'], act['zip_text'])
+                mark(node)
                 applied.append(label)
             elif st == 'changed':
                 skipped.append((label, 'differs — pick a side in the TUI (o/t/m)'))
