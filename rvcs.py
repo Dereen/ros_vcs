@@ -1585,10 +1585,11 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
     lfiles.update(_split_patch_by_file(ldirty.get('unstaged', '')))
     zun, lun = zdirty.get('untracked', {}), ldirty.get('untracked', {})
 
-    def zip_change_contained(path, zp):
-        """True if the zip's patch for path is already contained in the local
-        file; False when it still brings something (or would conflict); None
-        when undecidable (zip base commit unknown, patch does not apply)."""
+    def zip_change_state(path, zp):
+        """How the zip's patch for path relates to the local file:
+        'contained' (already in it), 'clean' (3-way merge applies without
+        conflicts and brings changes), 'conflict' (3-way merge conflicts),
+        or None when undecidable (zip base commit unknown / patch broken)."""
         if not (repo_path and zip_sha):
             return None
         base = _git_show_head(repo_path, path, rev=zip_sha)
@@ -1601,15 +1602,17 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
         except OSError:
             return None
         if ours == theirs:
-            return True
+            return 'contained'
         merged, n = _merge_texts(ours, base, theirs)
-        return n == 0 and merged == ours
+        if n:
+            return 'conflict'
+        return 'contained' if merged == ours else 'clean'
 
     nodes, counts = [], {'+': 0, '-': 0, '~': 0, '=': 0}
     for path in sorted(set(zfiles) | set(lfiles)):
         zp, lp = zfiles.get(path), lfiles.get(path)
         act = {'kind': 'patch', 'repo': repo_path, 'file': path,
-               'zip_patch': zp, 'local_patch': lp}
+               'zip_patch': zp, 'local_patch': lp, 'zip_sha': zip_sha}
         # A local file still carrying conflict markers (from an earlier merge
         # of THIS or any tool) is flagged in every session, not just the one
         # that wrote them.
@@ -1622,12 +1625,21 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             nodes[-1]['act'] = act
             continue
         if zp is not None and lp is None:
-            if zip_change_contained(path, zp):
+            state = zip_change_state(path, zp)
+            if state == 'contained':
                 counts['='] += 1
                 nodes.append(_node(f"{path}  (zip change already in local)", 'same',
                                    ["The zip's uncommitted patch is already contained in the",
                                     'local file (committed or applied here since the export).',
                                     ''] + zp.splitlines()))
+            elif state == 'conflict':
+                counts['~'] += 1
+                nodes.append(_node(f"{path}  (zip change CONFLICTS with local version)",
+                                   'changed',
+                                   ["The zip's patch collides with changes made here since the",
+                                    'export — u skips this file. d previews the merge with',
+                                    'markers; then m (merge), o (keep local) or t (zip version).',
+                                    '', '── patch in zip ──'] + zp.splitlines()))
             else:
                 counts['+'] += 1
                 nodes.append(_node(f"{path}  (modified only in zip)", 'added',
@@ -1637,7 +1649,8 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             nodes.append(_node(f"{path}  (modified only locally)", 'removed',
                                ['── patch in local workspace ──'] + lp.splitlines()))
         elif zp != lp:
-            if zip_change_contained(path, zp):
+            state = zip_change_state(path, zp)
+            if state == 'contained':
                 counts['='] += 1
                 nodes.append(_node(f"{path}  (zip change contained; local has own edits)",
                                    'same',
@@ -1646,10 +1659,11 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
                                     '', '── patch in zip ──'] + zp.splitlines() +
                                    ['', '── patch in local workspace ──'] + lp.splitlines()))
             else:
-                counts['~'] += 1
-                nodes.append(_node(f"{path}  (patches differ)", 'changed',
+                note = ' — merge would conflict' if state == 'conflict' else ''
+                nodes.append(_node(f"{path}  (patches differ{note})", 'changed',
                                    ['── patch in zip ──'] + zp.splitlines() +
                                    ['', '── patch in local workspace ──'] + lp.splitlines()))
+                counts['~'] += 1
         else:
             counts['='] += 1
             nodes.append(_node(f"{path}  (same patch)", 'same',
@@ -2031,8 +2045,9 @@ def _merge_preview(node):
                        'diverged: t creates a merge commit '
                        '(%d local vs %d zip commit(s))' % (act['ahead'], act['behind']))]
         return lines
-    if act.get('kind') == 'patch' and act.get('zip_patch') and act.get('local_patch'):
-        base = _git_show_head(act['repo'], act['file'])
+    if act.get('kind') == 'patch' and act.get('zip_patch'):
+        base_rev = act.get('zip_sha') or 'HEAD'
+        base = _git_show_head(act['repo'], act['file'], rev=base_rev)
         theirs = _apply_patch_to_text(base, act['zip_patch'], act['file'])
         local_path = os.path.join(act['repo'], act['file'])
         try:
@@ -2040,10 +2055,11 @@ def _merge_preview(node):
         except OSError:
             ours = ''
         if theirs is None:
-            return ['(cannot preview: zip patch does not apply onto local HEAD '
-                    'version of the file)']
+            return ['(cannot preview: zip patch does not apply onto the %s '
+                    'version of the file)' % ('zip base' if act.get('zip_sha') else 'HEAD')]
         merged, n = _merge_texts(ours, base, theirs)
-        head = ['── 3-way merge preview: %d conflict(s) ──' % n, '']
+        head = ['── 3-way merge preview (base: %s): %d conflict(s) ──'
+                % (base_rev[:9], n), '']
         return head + merged.splitlines()
     if act.get('kind') == 'untracked' and act.get('zip_entry') and act.get('local_entry'):
         zb, ztext, _ = _untracked_text(act['zip_entry'])
@@ -2220,7 +2236,6 @@ def apply_action(node, mode, ctx):
         zp, lp = act.get('zip_patch'), act.get('local_patch')
         if mode == 'ours':
             return _finish(node, 'done', 'kept local')
-        base_text = _git_show_head(repo_path, rel_file)
         if zp is None:                       # modified only locally, theirs = revert
             if mode == 'merge':
                 return _finish(node, 'done', 'kept local (zip has no change)')
@@ -2230,16 +2245,23 @@ def apply_action(node, mode, ctx):
             except Exception as e:
                 return _finish(node, 'conflict', f'revert failed: {e}')
             return _finish(node, 'done', 'reverted to HEAD (as in zip)')
+        # base = the commit the zip's patch was made against, when it is known
+        # locally; HEAD only as a fallback
+        base_rev = act.get('zip_sha') or 'HEAD'
+        base_text = _git_show_head(repo_path, rel_file, rev=base_rev)
         theirs = _apply_patch_to_text(base_text, zp, rel_file)
         if theirs is None:
-            return _finish(node, 'conflict', 'zip patch does not apply onto local HEAD')
-        if lp is None or mode == 'theirs':   # take zip side wholesale
+            return _finish(node, 'conflict', 'zip patch does not apply onto %s'
+                           % ('its base commit' if act.get('zip_sha') else 'local HEAD'))
+        if mode == 'theirs':                 # take zip side wholesale
             _write_local(ctx, local_path, theirs)
             return _finish(node, 'done', 'took zip version')
         try:
             ours = open(local_path, encoding='utf-8', errors='replace').read()
         except OSError:
-            ours = ''
+            ours = base_text
+        if ours == theirs:
+            return _finish(node, 'done', 'already identical')
         merged, n = _merge_texts(ours, base_text, theirs)
         _write_local(ctx, local_path, merged)
         if n:
