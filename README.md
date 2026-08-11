@@ -14,6 +14,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Pipelines**: Back up one *slice* of a shared workspace (the repos one line of research uses) together with its tmuxinator session configs
 - **Colcon config**: `colcon_defaults.yaml` / `.colcon/config.yaml` travel with the export, so a workspace pins its own build settings instead of every importer passing them by hand
 - **Git-bundle fallback**: Repos whose HEAD no remote can serve (unpushed commits, no remote, or a configured remote that doesn't exist) are embedded in the zip as git bundles, so exports are restorable without pushing first
+- **Pull all/selected**: Fetch + fast-forward every repo (or a chosen subset) against its own remote; a repo blocked on an interactive auth prompt gets the real command staged, unexecuted, in a tmux window instead of hanging
 
 ## Installation
 
@@ -378,6 +379,43 @@ locally-tracked files the zip only has as untracked, binary divergence, and
 all local-only changes. Each skip is reported with its reason and a pointer to
 the `--diff-state` TUI; originals of everything written go to
 `/tmp/rvcs_merge_backup_<timestamp>/`.
+
+### Pull every repo (or a selected subset) from its own remote
+
+The other half of "keep everything current" — this doesn't touch a zip at
+all, it fetches + fast-forwards each repo against its OWN configured
+upstream:
+
+```bash
+./rvcs.py --pull ~/marv_ws                          # every repo under src/
+./rvcs.py --pull ~/marv_ws --repos foo,bar           # only these (src-relative)
+./rvcs.py --pull ~/marv_ws --pipeline p.pipeline.yaml  # only a pipeline's repos
+./rvcs.py --pull ~/marv_ws --dry-run                 # report only, nothing written
+```
+
+Per repo: fetch (with every interactive prompt disabled — `BatchMode=yes` +
+`GIT_TERMINAL_PROMPT=0`, so a passphrase/credential/host-key prompt fails
+immediately instead of hanging), then:
+
+- **up to date** (`=`) or **strictly behind** (`✓`, auto fast-forwarded —
+  reusing the exact same dirty-preserving ff as `--update-state`: local
+  edits that already contain the incoming change survive uncommitted,
+  anything else blocks and is reported, never guessed at)
+- **ahead only** (`^`, your unpushed commits — nothing to pull)
+- **diverged** (`!`, both ahead and behind — reported with the merge
+  command, never auto-merged; a real merge commit stays a human decision)
+- **needs authentication** (`A`, red) — the fetch was blocked exactly where
+  it would have needed a human at a terminal. The real command
+  (`git -C <repo> pull`) is staged, **unexecuted**, in a tmux window (the
+  session this process is already running in, or `--tmux-session NAME`,
+  default `rvcs-pull`) via `send-keys` with no trailing Enter — review it
+  and press Enter yourself. Re-running `--pull` reuses that window instead
+  of clobbering a passphrase you're mid-typing into it.
+
+Colored when stdout is a terminal (`NO_COLOR` respected); a plain summary
+line and per-repo status otherwise. `--push` exists as a stub (`git push`
+being unattended is a bigger decision than an unattended fetch) — not
+implemented yet.
 
 ### Compare Workspaces
 
