@@ -1845,7 +1845,7 @@ def _commit_nodes(repo_path, zip_sha, cinfo):
             stat.stdout.decode('utf-8', 'replace').splitlines()[:40]))
     if cinfo['ahead']:
         mine = log(f'{zip_sha}..HEAD')
-        nodes.append(_node(f"commits only local ({len(mine)})", 'removed',
+        nodes.append(_node(f"commits only local ({len(mine)})", 'ahead',
                            ['Your work — the zip has none of it; never touched.',
                             ''] + mine))
     if cinfo['behind'] and cinfo['ahead']:
@@ -1969,6 +1969,8 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         takeable = bool(fcounts['+'] or fcounts['~']) \
             or not cinfo['known'] or bool(cinfo['behind'])
         if not takeable:
+            # nothing to TAKE, but say plainly when the local side is ahead:
+            # '^' in ahead-yellow, which bubbles up to the section and root
             summary['='] += 1
             bits = []
             if cinfo['ahead']:
@@ -1976,8 +1978,9 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             if fcounts['-']:
                 bits.append(f"{fcounts['-']} local-only change(s)")
             n = _node(f"{rel}  (nothing to take — {', '.join(bits) or 'local work only'})",
-                      'same', clines)
-            n['children'] = file_nodes
+                      'ahead' if cinfo['ahead'] else 'same', clines)
+            n['children'] = (_commit_nodes(lpath, zsha, cinfo)
+                             if cinfo['known'] and cinfo['ahead'] else []) + file_nodes
             repos_sec['children'].append(n)
             continue
         summary['~'] += 1
@@ -2093,8 +2096,11 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             len(zrepos), len(set(zrepos) & set(local_repos)), len(local_only)),
         'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
         '',
-        'legend: + only in zip   - only local   ~ differs   = in sync   ✓ resolved   ! conflict',
-        '        tree colors bubble up: a parent is colored by the WORST status beneath it',
+        'legend: + only in zip   - only local   ^ local ahead   ~ differs',
+        '        = in sync   ✓ resolved   ! conflict/clash',
+        'colors: a parent takes the WORST status beneath it, by this priority',
+        '        (low to high):  = in sync  <  ✓ resolved  <  - local-only change',
+        '        <  ^ local ahead  <  + to take  <  ~ differs  <  ! needs you',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
         'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
     '        u = safe batch update: apply every NON-conflicting zip change',
@@ -2110,14 +2116,27 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
 
 
 _STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' ',
-                 'done': '✓', 'conflict': '!', 'clash': '!'}
+                 'done': '✓', 'conflict': '!', 'clash': '!', 'ahead': '^'}
 
-# how alarming a status is — parents are COLORED by the worst status found
-# in their subtree so a collapsed node can't hide a purple clash behind
-# an innocent yellow. Local-only changes ('removed') rank lowest of the
-# non-info states: they ask nothing of the user and never tint a parent.
-_SEVERITY = {'info': 0, 'removed': 1, 'same': 2, 'done': 3, 'added': 4,
-             'changed': 5, 'clash': 6, 'conflict': 7}
+# PROPAGATION PRIORITY — a parent is colored by the worst status in its
+# subtree, so a collapsed repo can never hide something that needs you.
+# The ladder, lowest first (higher number wins when they meet):
+#
+#   0 info      structural node, nothing to say
+#   1 same      = identical on both sides
+#   2 done      ✓ resolved by an action this session
+#   3 removed   - local-only FILE change; the zip has nothing here
+#   4 ahead     ^ local is AHEAD of the zip (your commits / your work)
+#   5 added     + the zip has something to take
+#   6 changed   ~ both sides differ, mergeable
+#   7 clash     ! the zip's change collides with local work
+#   8 conflict  ! conflict markers sitting in the file
+#
+# Rationale: informational states (your own work: removed/ahead) rank below
+# actionable ones (something to take: added/changed), which rank below
+# states that need a human decision (clash/conflict).
+_SEVERITY = {'info': 0, 'same': 1, 'done': 2, 'removed': 3, 'ahead': 4,
+             'added': 5, 'changed': 6, 'clash': 7, 'conflict': 8}
 
 
 def _annotate_worst(node):
@@ -2864,8 +2883,9 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
         return out
 
     LEGEND = [('+ only in zip', 'added'), ('- only local', 'removed'),
-              ('~ differs', 'changed'), ('= in sync', 'same'),
-              ('✓ resolved', 'done'), ('! conflict', 'conflict')]
+              ('^ local ahead', 'ahead'), ('~ differs', 'changed'),
+              ('= in sync', 'same'), ('✓ resolved', 'done'),
+              ('! conflict', 'conflict')]
 
     def draw(stdscr, rows, sel, tree_top, detail_off, colors):
         stdscr.erase()
@@ -3048,6 +3068,8 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             # pre-merge collisions ('would conflict', still actionable via
             # o/t/m) share the conflict purple so they stand out from ~
             colors['clash'] = colors.get('conflict', 0)
+            # local-ahead: yellow like ~, distinguished by its '^' glyph
+            colors['ahead'] = colors.get('changed', 0)
         sel, tree_top, detail_off = 0, 0, 0
         while True:
             rows = flatten(root)

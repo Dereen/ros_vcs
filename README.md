@@ -275,6 +275,23 @@ locally but not in the zip are summarized, not flagged. Keys: `j/k` move,
 `l`/`Enter` expand, `h` collapse (again: jump to parent), `J/K`/`PgUp/PgDn`
 scroll the detail pane, `g/G` top/bottom, `q` quit.
 
+Colors bubble **up**: a parent (repo row, section, root) is painted with the
+worst status anywhere beneath it, so a collapsed node can never hide
+something that needs you. The priority, lowest to highest:
+
+| | status | meaning |
+|-|--------|---------|
+|`=`| in sync | identical on both sides |
+|`✓`| resolved | an action settled it this session |
+|`-`| local-only change | a file only you changed; the zip has nothing here |
+|`^`| local ahead | your commits, which the zip does not have |
+|`+`| to take | the zip has something you don't |
+|`~`| differs | both sides changed it, mergeable |
+|`!`| needs you | the zip's change clashes with yours, or markers sit in the file |
+
+Informational states (your own work) rank below actionable ones (something
+to take), which rank below states needing a human decision.
+
 The comparison is **content-aware**: a zip-side change you already have —
 its dirty patch committed here since the export, or its untracked file now
 tracked locally with identical content — shows as `=` (`zip change already
