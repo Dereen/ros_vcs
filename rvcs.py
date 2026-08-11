@@ -1814,6 +1814,27 @@ def _commit_nodes(repo_path, zip_sha, cinfo):
         return [l for l in r.stdout.decode('utf-8', 'replace').splitlines() if l]
 
     nodes = []
+    # where the two histories part: the merge base, plus a graph of both
+    # sides above it ('<' = local only, '>' = zip only, 'o' = the fork point)
+    base = subprocess.run(['git', '-C', repo_path, 'merge-base', 'HEAD', zip_sha],
+                          capture_output=True).stdout.decode().strip()
+    if base and cinfo['behind'] and cinfo['ahead']:
+        binfo = subprocess.run(
+            ['git', '-C', repo_path, 'log', '-1', '--date=short',
+             '--format=%h  %ad  %an  %s', base],
+            capture_output=True).stdout.decode('utf-8', 'replace').strip()
+        graph = subprocess.run(
+            ['git', '-C', repo_path, 'log', '--graph', '--oneline',
+             '--boundary', '--left-right', f'HEAD...{zip_sha}'],
+            capture_output=True).stdout.decode('utf-8', 'replace').splitlines()
+        nodes.append(_node(
+            f"diverged at {binfo.split('  ')[0]} — {binfo.split('  ')[-1][:60]}",
+            'info',
+            ['The last commit both sides share (fork point):', '',
+             '    ' + binfo, '',
+             '── history since the fork ──',
+             "   '<' only local      '>' only in zip      'o' the fork point", ''] +
+            graph[:60]))
     if cinfo['behind']:
         incoming = log(f'HEAD..{zip_sha}')
         stat = subprocess.run(['git', '-C', repo_path, 'show', '--stat',
@@ -2908,6 +2929,12 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                 attr = colors.get('removed', 0)
             elif line.startswith('@@') or line.startswith('──'):
                 attr = colors.get('info', 0)
+            elif re.match(r'^[|/\\ ]*<', line):      # graph: local-only commit
+                attr = colors.get('removed', 0)
+            elif re.match(r'^[|/\\ ]*>', line):      # graph: zip-only commit
+                attr = colors.get('added', 0)
+            elif re.match(r'^[|/\\ ]*o ', line):     # graph: the fork point
+                attr = colors.get('info', 0) | curses.A_BOLD
             for chunk in [line[i:i + dw] for i in range(0, len(line), dw)] or ['']:
                 if row >= tree_h:
                     break
