@@ -680,7 +680,9 @@ def export_pipeline_state(pipeline_file, workspace_path=None, output_dir=None):
     The zip contains everything a plain workspace export has (workspace.repos
     manifest + workspace.state.yaml with uncommitted changes), restricted to the
     repos the pipeline lists, PLUS:
-      pipeline.yaml       - the pipeline definition itself
+      pipeline/<basename> - the pipeline definition itself, under its own
+                            filename (import installs it to the canonical
+                            <output_dir>/pipeline/ directory)
       tmuxinator/<name>   - the tmuxinator session configs, verbatim
       extra/<rel_path>    - raw copies of non-repo paths (workspace-relative)
 
@@ -702,7 +704,11 @@ def export_pipeline_state(pipeline_file, workspace_path=None, output_dir=None):
     if pipeline['repos']:
         print(f"  Repos: {', '.join(pipeline['repos'])}")
 
-    extra_files = {'pipeline.yaml': open(pipeline_file, 'rb').read()}
+    # arcname keeps the real filename (flipper_eval.pipeline.yaml, not a
+    # generic 'pipeline.yaml') so multiple pipelines coexist under the
+    # canonical pipeline/ directory on import instead of overwriting each other
+    extra_files = {f'pipeline/{os.path.basename(pipeline_file)}':
+                   open(pipeline_file, 'rb').read()}
 
     for tmux_path in pipeline['tmuxinator']:
         if os.path.isfile(tmux_path):
@@ -1144,7 +1150,9 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
       tmuxinator/* -> <output_dir>/tmuxinator/ (and, with install_tmuxinator,
                       copied into ~/.config/tmuxinator/)
       extra/*      -> <output_dir>/ (workspace-relative non-repo paths)
-      pipeline.yaml-> <output_dir>/
+      pipeline/*   -> <output_dir>/pipeline/  (the canonical pipeline
+                      directory; older zips carrying a bare 'pipeline.yaml'
+                      member land there too, under that same name)
 
     Args:
         input_file: Path to .workspace.zip/.pipeline.zip, .repos file, or directory
@@ -1199,6 +1207,7 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                     bundle_files[rel] = dest
             pipeline_members = [n for n in zf.namelist()
                                 if n == 'pipeline.yaml'
+                                or n.startswith('pipeline/')
                                 or n.startswith('tmuxinator/')
                                 or n.startswith('extra/')]
             if pipeline_members:
@@ -1206,7 +1215,8 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                 # extra/* is verbatim user content and repos are tracked git
                 # trees, so both are restored byte-for-byte regardless.
                 rewritable = [n for n in pipeline_members
-                              if n == 'pipeline.yaml' or n.startswith('tmuxinator/')]
+                              if n == 'pipeline.yaml' or n.startswith('pipeline/')
+                              or n.startswith('tmuxinator/')]
 
                 export_root = (state_data or {}).get('workspace_root')
                 if rewrite_paths and not export_root and rewritable:
@@ -1244,18 +1254,39 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
 
                 # Restore pipeline payload into the new workspace. extra/<rel>
                 # entries land at their workspace-relative path; tmuxinator
-                # configs land in <output_dir>/tmuxinator/ so nothing outside
-                # the target is touched without install_tmuxinator.
+                # configs land in <output_dir>/tmuxinator/, pipeline
+                # definitions in the canonical <output_dir>/pipeline/ — so
+                # nothing outside the target is touched without
+                # install_tmuxinator.
                 for member in pipeline_members:
                     if member.endswith('/'):
                         continue
+                    content = rewritten.get(member) or zf.read(member)
                     if member.startswith('extra/'):
                         dest = os.path.join(output_dir, os.path.relpath(member, 'extra'))
+                    elif member == 'pipeline.yaml':
+                        # Pre-canonical-directory zip: a bare 'pipeline.yaml'
+                        # member carries no real filename. Recover one from
+                        # the pipeline's own required 'name:' key so it still
+                        # lands under a meaningful name, not a generic one.
+                        pname = None
+                        try:
+                            doc = yaml.safe_load(content.decode('utf-8'))
+                            if isinstance(doc, dict):
+                                pname = doc.get('name')
+                        except Exception:
+                            pass
+                        fname = f"{pname}.pipeline.yaml" if pname else 'pipeline.yaml'
+                        dest = os.path.join(output_dir, 'pipeline', fname)
                     else:
                         dest = os.path.join(output_dir, member)
                     os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
                     with open(dest, 'wb') as out:
-                        out.write(rewritten.get(member) or zf.read(member))
+                        out.write(content)
+                pipe_files = [n for n in pipeline_members
+                             if n == 'pipeline.yaml' or n.startswith('pipeline/')]
+                if pipe_files:
+                    print(f"  Restored pipeline definition to {os.path.join(output_dir, 'pipeline')}/")
                 tmux_files = [n for n in pipeline_members if n.startswith('tmuxinator/')]
                 if tmux_files:
                     print(f"  Restored tmuxinator configs to {os.path.join(output_dir, 'tmuxinator')}/")

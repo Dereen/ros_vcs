@@ -110,8 +110,9 @@ Export a pipeline (creates `<name>_<date>.pipeline.zip`):
 ```
 
 The zip contains the usual `workspace.repos` + `workspace.state.yaml` (restricted to the
-pipeline's repos, uncommitted changes included), plus `pipeline.yaml` (the definition),
-`tmuxinator/<name>.yml`, and `extra/<path>` raw files.
+pipeline's repos, uncommitted changes included), plus `pipeline/<basename>.pipeline.yaml`
+(the definition, under its real filename), `tmuxinator/<name>.yml`, and `extra/<path>`
+raw files.
 
 Status of only the pipeline's repos:
 
@@ -119,7 +120,9 @@ Status of only the pipeline's repos:
 ./rvcs.py --pipeline overhang.pipeline.yaml
 ```
 
-Import works with the standard command; tmuxinator configs are restored to
+Import works with the standard command; the pipeline definition is restored to the
+canonical `<workspace>/pipeline/` directory (multiple pipelines coexist there under
+their own filenames — nothing overwrites another), tmuxinator configs are restored to
 `<workspace>/tmuxinator/` (add `--install-tmuxinator` to also copy them into
 `~/.config/tmuxinator/`), and `extra_paths` are restored to their original
 workspace-relative locations:
@@ -146,7 +149,7 @@ Zips written before this existed have no recorded root; import infers it from
 the payload instead (`Inferred export-time workspace root: ...`). Use
 `--no-path-rewrite` to restore the payload byte-for-byte.
 
-Only files rvcs itself wrote into the zip are rewritten — `pipeline.yaml` and
+Only files rvcs itself wrote into the zip are rewritten — `pipeline/*` and
 `tmuxinator/*`. Repository working trees and `extra_paths` content are never
 touched: they are tracked git content, and rewriting them would show up as
 phantom diffs. Paths hardcoded *inside* the repos are reported after import
