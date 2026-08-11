@@ -285,12 +285,20 @@ The tree is also a MERGE tool — every action applies to the selected node
 | `t` | accept **theirs** — make the local file(s) match the zip (after y/N confirm) |
 | `m` | 3-way **merge** (base = local HEAD): non-overlapping changes combine, overlaps get `<<<<<<< local` / `>>>>>>> zip` conflict markers written into the file for manual resolution |
 | `M` | merge **all** — the whole tree |
+| `u` | safe batch **update** — apply every non-conflicting zip change (`--update-state` semantics: conflicting files stay untouched and are listed), then walk the leftovers with `o`/`t`/`m` |
+| `r` | reload the diff from disk (also happens automatically after every action) |
 
 Resolved nodes turn `✓`, conflicted ones `!`. Before the first modification of
 any file its original is copied to `/tmp/rvcs_merge_backup_<timestamp>/`, and
-the backup path is shown in the root node after every action. Commit
-divergence is reported but never merged automatically — fetch the zip's
-`bundles/` for that.
+the backup path is shown in the root node after every action.
+
+Commit divergence is handled on the **repo** node: when the zip's commits
+exist only in its `bundles/`, `t` first *fetches* the bundle (refs only,
+under `refs/rvcs-bundle/`, working tree untouched); after the automatic
+reload `t` *merges* the now-visible commits — fast-forward when the local
+repo is strictly behind, a real merge commit when diverged, and a clean
+abort with a hint when the merge conflicts. Zip-only commits without a
+bundle live on the repo's remote — `git fetch` there, then `r`.
 
 For scripts and AI tooling (e.g. Claude Code), dump the same tree as JSON
 instead of opening the TUI:
