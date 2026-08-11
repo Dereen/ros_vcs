@@ -1840,6 +1840,8 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         'legend: + only in zip   - only local   ~ differs   = in sync   ✓ resolved   ! conflict',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
         'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
+    '        u = safe batch update: apply every NON-conflicting zip change',
+    '        (3-way merge; conflicting files stay untouched, then walk them with o/t/m)',
         '        after every action the diff RELOADS from disk (r = reload manually);',
         '        ✓/! marks persist across reloads for this session',
         '        (o/t/m act on the selected node AND everything beneath it;',
@@ -2177,7 +2179,8 @@ def apply_subtree(node, mode, ctx):
     return count
 
 
-def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=False):
+def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=False,
+                           ctx=None):
     """Apply every NON-conflicting change from an export zip to the workspace.
 
     - zip-side changes are taken via a true 3-way merge: when the zip HEAD
@@ -2187,11 +2190,13 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
       conflict-free; anything conflicting is left untouched and reported
     - local-only changes are never reverted, nothing is ever deleted
     Returns (applied, skipped, kept, ctx); dry_run writes nothing.
+    A caller with its own _MergeCtx (the TUI's u key) can pass it so all
+    backups of one session share a directory.
     """
     import subprocess
     zm = load_state_zip(zip_path)
     root = compute_state_diff(zip_path, workspace, include_paths)
-    ctx = _MergeCtx(workspace)
+    ctx = ctx or _MergeCtx(workspace)
     src = os.path.join(workspace, 'src')
     if not os.path.isdir(src):
         src = workspace
@@ -2387,9 +2392,11 @@ def _walk_paths(node, prefix=()):
         yield from _walk_paths(c, path)
 
 
-def run_diff_tui(root, ctx=None, rebuild=None):
+def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
     """Curses tree browser: left pane = diff tree, right pane = node detail.
-    With a _MergeCtx, o/t/m/M apply accept-ours/accept-theirs/merge actions.
+    With a _MergeCtx, o/t/m/M apply accept-ours/accept-theirs/merge actions;
+    with an updater callable, u batch-applies every NON-conflicting zip change
+    (--update-state semantics: conflicts left untouched for o/t/m).
     After every action (and on 'r') the diff is recomputed from disk via
     rebuild(); resolved/conflict marks are overlaid, expansion + cursor kept."""
     import curses
@@ -2461,7 +2468,7 @@ def run_diff_tui(root, ctx=None, rebuild=None):
             except curses.error:
                 pass
             x += len(text) + 3
-        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M all  r reload  q quit' % (
+        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M all  u update  r reload  q quit' % (
             sel + 1, len(rows))
         try:
             stdscr.addnstr(maxy - 1, 0, status.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
@@ -2602,6 +2609,25 @@ def run_diff_tui(root, ctx=None, rebuild=None):
                         note += f'   backup: {ctx.backup_dir}'
                     ctx.log(note)
                     root, sel = reload_tree(root, sel, note)
+                detail_off = 0
+            elif ch == ord('u') and ctx is not None and updater is not None:
+                if confirm(stdscr, 'apply ALL non-conflicting zip changes? '
+                                   'conflicts stay untouched (backup kept)'):
+                    try:
+                        applied, skipped, kept = updater(ctx)[:3]
+                    except Exception as e:
+                        root, sel = reload_tree(root, sel, f'update failed: {e}')
+                        detail_off = 0
+                        continue
+                    note = ('update: %d applied, %d skipped (need o/t/m), '
+                            '%d local-only kept' % (len(applied), len(skipped), len(kept)))
+                    if ctx.backup_dir:
+                        note += f'   backup: {ctx.backup_dir}'
+                    ctx.log(note)
+                    root, sel = reload_tree(root, sel, note)
+                    if skipped:
+                        root['detail'][1:1] = ['  still needs a human:'] + \
+                            ['    ! %s: %s' % s for s in skipped[:15]]
                 detail_off = 0
             elif ch == ord('r'):
                 root, sel = reload_tree(root, sel, 'reloaded from disk')
@@ -2756,7 +2782,9 @@ Examples:
         else:
             run_diff_tui(root, ctx=_MergeCtx(workspace),
                          rebuild=lambda: compute_state_diff(zip_arg, workspace,
-                                                            include_paths=include))
+                                                            include_paths=include),
+                         updater=lambda c: update_workspace_state(
+                             zip_arg, workspace, include_paths=include, ctx=c))
         exit(0)
 
     # Handle --export-pipeline mode
