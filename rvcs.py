@@ -3279,6 +3279,273 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
         pass  # Ctrl-C quits like q, without a traceback
 
 
+# ---------------------------------------------------------------------------
+# --pull: fetch + fast-forward every repo (or a selected subset) against its
+# OWN configured remote (a live git pull, distinct from the zip-vs-workspace
+# diff above). A repo blocked on an interactive SSH/credential prompt gets
+# the real command staged, unexecuted, in a tmux window -- never entered or
+# guessed at here (this process has no passphrase to give it).
+# push is intentionally NOT implemented yet; --push exists only as a
+# discoverable stub so the CLI shape is stable when it lands.
+# ---------------------------------------------------------------------------
+
+_AUTH_FAIL_PATTERNS = (
+    'permission denied',              # ssh publickey / password, either way
+    'could not read username',        # https credential prompt, blocked
+    'could not read password',
+    'terminal prompts disabled',      # GIT_TERMINAL_PROMPT=0 tripped
+    'host key verification failed',   # needs an interactive accept
+    'authentication failed',
+    'no supported authentication methods',
+)
+
+_PULL_STATUS_STYLE = {   # status -> (glyph, ansi color name)
+    'up-to-date':  ('=', 'gray'),
+    'pulled':      ('✓', 'bgreen'),   # auto-pulled -- the thing to see
+    'ahead':       ('^', 'yellow'),
+    'diverged':    ('!', 'magenta'),
+    'blocked':     ('!', 'magenta'),
+    'auth':        ('A', 'bred'),          # needs a human at a terminal
+    'error':       ('E', 'red'),
+    'no-upstream': ('·', 'gray'),
+    'skipped':     ('·', 'gray'),
+}
+
+_ANSI = {'red': '\x1b[31m', 'bred': '\x1b[1;31m', 'green': '\x1b[32m',
+         'bgreen': '\x1b[1;32m', 'yellow': '\x1b[33m', 'magenta': '\x1b[35m',
+         'cyan': '\x1b[36m', 'gray': '\x1b[90m', 'bold': '\x1b[1m',
+         'reset': '\x1b[0m'}
+
+
+def _color(text, name, enabled):
+    if not enabled or not name:
+        return text
+    return f"{_ANSI.get(name, '')}{text}{_ANSI['reset']}"
+
+
+def _classify_fetch_failure(stderr_text):
+    """'auth' when the failure looks like a blocked interactive prompt
+    (passphrase, credential, host-key-accept) -- the case a human at a
+    terminal can resolve; 'error' for anything else (network, misconfigured
+    remote, ...), which staging a tmux window would not fix."""
+    low = (stderr_text or '').lower()
+    return 'auth' if any(p in low for p in _AUTH_FAIL_PATTERNS) else 'error'
+
+
+def _repo_upstream(repo_path):
+    """(remote_name, upstream_ref) e.g. ('origin', 'origin/main'), or None
+    if the current branch has no configured upstream (nothing to pull)."""
+    r = subprocess.run(['git', '-C', repo_path, 'rev-parse',
+                        '--abbrev-ref', '--symbolic-full-name', '@{u}'],
+                       capture_output=True)
+    if r.returncode != 0:
+        return None
+    upstream = r.stdout.decode('utf-8', 'replace').strip()
+    remote = upstream.split('/', 1)[0] if '/' in upstream else upstream
+    return remote, upstream
+
+
+def _fetch_repo(repo_path, remote):
+    """One `git fetch <remote>` with every interactive prompt disabled --
+    BatchMode blocks ssh from falling back to a passphrase/host-key prompt,
+    GIT_TERMINAL_PROMPT=0 blocks git's own credential prompt. This makes the
+    probe and the real fetch the SAME operation: if it would have needed a
+    human, it fails immediately here instead of hanging one open.
+    Returns ('ok'|'auth'|'error', note)."""
+    env = os.environ.copy()
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    pinned = subprocess.run(['git', '-C', repo_path, 'config', '--get',
+                             'core.sshCommand'], capture_output=True)
+    base_ssh = pinned.stdout.decode('utf-8', 'replace').strip() or 'ssh'
+    env['GIT_SSH_COMMAND'] = f'{base_ssh} -o BatchMode=yes -o ConnectTimeout=10'
+    try:
+        r = subprocess.run(['git', '-C', repo_path, 'fetch', remote],
+                           capture_output=True, env=env, timeout=30)
+    except subprocess.TimeoutExpired:
+        return 'error', 'fetch timed out after 30s'
+    if r.returncode == 0:
+        return 'ok', ''
+    stderr = r.stderr.decode('utf-8', 'replace').strip()
+    kind = _classify_fetch_failure(stderr)
+    return kind, (stderr.splitlines()[-1] if stderr else f'exit {r.returncode}')
+
+
+def _tmux_available():
+    return shutil.which('tmux') is not None
+
+
+def _current_tmux_session():
+    """Name of the tmux session THIS process runs inside, or None if not
+    running under tmux at all."""
+    if not os.environ.get('TMUX') or not _tmux_available():
+        return None
+    r = subprocess.run(['tmux', 'display-message', '-p', '#S'], capture_output=True)
+    name = r.stdout.decode('utf-8', 'replace').strip()
+    return name or None
+
+
+def _sanitize_tmux_name(name, prefix='pull-', max_len=40):
+    """'.' and ':' are NOT safe here even though tmux allows them in a raw
+    window name: this name is later embedded in a 'session:window' TARGET
+    string (see stage_tmux_command/pull_repo), where '.' is tmux's own
+    pane-index separator -- 'sess:pull-foo.bar' parses as window 'pull-foo'
+    pane 'bar' and fails with "can't find pane". Excluding both up front
+    avoids that whole class of target-parsing bug."""
+    safe = re.sub(r'[^A-Za-z0-9_-]+', '_', name).strip('_') or 'repo'
+    return (prefix + safe)[:max_len]
+
+
+def stage_tmux_command(command, window_name, session=None):
+    """Stage `command` in a tmux window WITHOUT running it -- send-keys with
+    no trailing Enter, exactly the pattern used throughout this project for
+    anything needing a passphrase Claude cannot type. Reuses an existing
+    window of the same name instead of clobbering it (it may already have a
+    partially-typed passphrase in it).
+    Returns (session, window, freshly_staged: bool, note)."""
+    if not _tmux_available():
+        return None, None, False, 'tmux is not installed -- cannot stage'
+    session = session or _current_tmux_session() or 'rvcs-pull'
+    window = _sanitize_tmux_name(window_name)
+    has = subprocess.run(['tmux', 'has-session', '-t', session], capture_output=True)
+    if has.returncode != 0:
+        subprocess.run(['tmux', 'new-session', '-d', '-s', session], capture_output=True)
+    existing = subprocess.run(['tmux', 'list-windows', '-t', session, '-F', '#W'],
+                              capture_output=True).stdout.decode('utf-8', 'replace').splitlines()
+    if window in existing:
+        return session, window, False, f'already staged in {session}:{window}'
+    subprocess.run(['tmux', 'new-window', '-d', '-t', session, '-n', window],
+                   capture_output=True)
+    subprocess.run(['tmux', 'send-keys', '-t', f'{session}:{window}', command],
+                   capture_output=True)
+    return session, window, True, f'staged in {session}:{window} — review and press Enter there'
+
+
+def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
+    """Pull ONE repo: fetch its upstream (non-interactively; auth needs stage
+    a tmux window instead of failing silently), then fast-forward when it's
+    now strictly behind (reusing the same dirty-preserving ff as --update-
+    state -- local edits that already contain the incoming change survive
+    uncommitted; anything else blocks and is reported, never guessed at).
+    Diverged repos are reported, not auto-merged -- a real merge commit stays
+    an explicit decision, same as the zip-diff side of this tool.
+    Returns a result dict: {rel, status, note, tmux}."""
+    up = _repo_upstream(repo_path)
+    if up is None:
+        return {'rel': rel, 'status': 'no-upstream',
+                'note': 'current branch has no configured upstream', 'tmux': None}
+    remote, upstream_ref = up
+
+    if dry_run:
+        # dry-run still fetches -- fetch never writes to the working tree or
+        # branch, so it's safe and the ahead/behind numbers below need it
+        pass
+    kind, note = _fetch_repo(repo_path, remote)
+    if kind == 'auth':
+        if dry_run:
+            return {'rel': rel, 'status': 'auth',
+                    'note': f'needs authentication ({note}) -- would stage a tmux window',
+                    'tmux': None}
+        cmd = f'git -C {shlex.quote(repo_path)} pull'
+        session, window, _fresh, stage_note = stage_tmux_command(
+            cmd, rel, session=tmux_session)
+        return {'rel': rel, 'status': 'auth',
+                'note': f'needs authentication ({note}) -- {stage_note}',
+                'tmux': f'{session}:{window}' if session else None}
+    if kind == 'error':
+        return {'rel': rel, 'status': 'error', 'note': note, 'tmux': None}
+
+    # fetch succeeded -- now purely local git, no network involved
+    ahead = int(subprocess.run(['git', '-C', repo_path, 'rev-list', '--count',
+                                f'{upstream_ref}..HEAD'],
+                               capture_output=True).stdout.decode().strip() or 0)
+    behind = int(subprocess.run(['git', '-C', repo_path, 'rev-list', '--count',
+                                 f'HEAD..{upstream_ref}'],
+                                capture_output=True).stdout.decode().strip() or 0)
+    if not ahead and not behind:
+        return {'rel': rel, 'status': 'up-to-date', 'note': '', 'tmux': None}
+    if ahead and behind:
+        return {'rel': rel, 'status': 'diverged',
+                'note': f'local ahead {ahead}, behind {behind} -- merge is a '
+                       f'human decision: git -C {repo_path} merge {upstream_ref}',
+                'tmux': None}
+    if ahead and not behind:
+        return {'rel': rel, 'status': 'ahead',
+                'note': f'{ahead} local commit(s) not on {upstream_ref} (nothing to pull)',
+                'tmux': None}
+    # strictly behind -- fast-forward, dry_run just reports feasibility
+    ok, plan_note, plan = _ff_plan(repo_path, upstream_ref)
+    if dry_run:
+        status = 'pulled' if ok else 'blocked'
+        return {'rel': rel, 'status': status,
+                'note': (f'would fast-forward {behind} commit(s)' if ok
+                        else f'ff blocked -- {plan_note}'), 'tmux': None}
+    if not ok:
+        return {'rel': rel, 'status': 'blocked', 'note': f'ff blocked -- {plan_note}',
+               'tmux': None}
+    done_ok, done_note = _dirty_preserving_ff(repo_path, upstream_ref, ctx=ctx)
+    if not done_ok:
+        return {'rel': rel, 'status': 'blocked', 'note': f'ff failed -- {done_note}',
+               'tmux': None}
+    return {'rel': rel, 'status': 'pulled', 'note': done_note, 'tmux': None}
+
+
+def pull_workspace(workspace, include_paths=None, repos_filter=None,
+                   tmux_session=None, dry_run=False):
+    """Pull every repo under workspace/src (or a `repos_filter` subset of
+    them -- 'selected'). Prints a colored status line per repo as it's
+    processed (auto-pulls in green, auth-needed in red -- the request this
+    was built for) and a final summary. Returns the list of result dicts."""
+    source_folder = os.path.join(workspace, 'src')
+    if not os.path.isdir(source_folder):
+        source_folder = workspace
+    color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+
+    repos = {}
+    for p in find_git_repos(source_folder):
+        rel = os.path.relpath(p, source_folder)
+        if repo_in_include_paths(rel, include_paths):
+            repos[rel] = p
+    if repos_filter:
+        missing = [r for r in repos_filter if r not in repos]
+        for m in missing:
+            print(_color(f'  ! {m}: not found under {source_folder}', 'red', color))
+        repos = {r: p for r, p in repos.items() if r in repos_filter}
+
+    if not repos:
+        print('No repos to pull.')
+        return []
+
+    print(f"Pulling {len(repos)} repo(s){' (dry run)' if dry_run else ''}:")
+    ctx = _MergeCtx(workspace)
+    results = []
+    for rel in sorted(repos):
+        res = pull_repo(repos[rel], rel, ctx=ctx, tmux_session=tmux_session,
+                        dry_run=dry_run)
+        results.append(res)
+        glyph, colname = _PULL_STATUS_STYLE.get(res['status'], ('?', None))
+        line = f"  {glyph} {rel}"
+        if res['note']:
+            line += f"  -- {res['note']}"
+        print(_color(line, colname, color))
+
+    counts = {}
+    for r in results:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
+    summary = '  '.join(f"{_PULL_STATUS_STYLE.get(k, ('?', None))[0]} {k}: {v}"
+                        for k, v in sorted(counts.items()))
+    print(f"\n{summary}")
+    if ctx.backup_dir:
+        print(f"Backups of anything touched: {ctx.backup_dir}")
+    auth_repos = [r for r in results if r['status'] == 'auth']
+    if auth_repos:
+        print(_color(f"\n{len(auth_repos)} repo(s) need authentication -- "
+                     "review the staged command(s) in tmux and press Enter:",
+                     'bred', color))
+        for r in auth_repos:
+            print(_color(f"  A {r['rel']}: {r['tmux']}", 'bred', color))
+    return results
+
+
 def main():
     """Main entry point for CLI."""
     global _debug
@@ -3319,7 +3586,7 @@ Examples:
                              'workspace (3-way merges; conflicting files are left untouched '
                              'and reported — resolve those in the --diff-state TUI)')
     parser.add_argument('--dry-run', action='store_true',
-                        help='With --update-state: only report what would be applied')
+                        help='With --update-state or --pull: only report what would be applied')
     parser.add_argument('--import-state', help='Import workspace from .workspace.zip/.pipeline.zip or .repos file')
     parser.add_argument('--state-file', help='State file with diffs (use with --import-state .repos)')
     parser.add_argument('--install-tmuxinator', action='store_true',
@@ -3340,6 +3607,18 @@ Examples:
                              'repointing the export-time workspace root at the import directory')
     parser.add_argument('--ignore', help='Ignore file with package names to exclude (status AND --export-state)')
     parser.add_argument('--name', help='Workspace name for --export-state output file (default: workspace dir name)')
+    parser.add_argument('--pull', action='store_true',
+                        help='Fetch + fast-forward every repo (or --repos, a selected subset) '
+                             "against its OWN remote. A repo blocked on an interactive SSH/"
+                             'credential prompt gets the real pull command staged (unexecuted) '
+                             'in a tmux window instead of hanging or failing silently.')
+    parser.add_argument('--repos', metavar='REPO[,REPO...]',
+                        help='With --pull: only these repos (src-relative paths), instead of all')
+    parser.add_argument('--tmux-session', metavar='NAME',
+                        help='With --pull: tmux session to stage auth-blocked pulls into '
+                             '(default: the session this process runs in, else "rvcs-pull")')
+    parser.add_argument('--push', action='store_true',
+                        help='Not implemented yet -- reserved for a future push counterpart to --pull')
     parser.add_argument('workspace', nargs='?', default=None, help='Workspace folder or output dir')
     args = parser.parse_args()
 
@@ -3361,6 +3640,30 @@ Examples:
         args.export_pipeline = os.path.expanduser(args.export_pipeline)
     if args.pipeline:
         args.pipeline = os.path.expanduser(args.pipeline)
+
+    if args.push:
+        print("--push is not implemented yet. --pull (fetch + fast-forward, with "
+              "tmux-staged auth) is available; a push counterpart is planned but "
+              "not built -- pushing stays a manual `git push` for now.")
+        exit(1)
+
+    # Handle --pull mode
+    if args.pull:
+        include = None
+        workspace = args.workspace
+        if args.pipeline:
+            p = load_pipeline(os.path.expanduser(args.pipeline))
+            include = p['repos'] or None
+            if workspace is None:
+                workspace = p.get('workspace')
+        workspace = workspace or os.getcwd()
+        repos_filter = None
+        if args.repos:
+            repos_filter = {r.strip() for r in args.repos.split(',') if r.strip()}
+        results = pull_workspace(workspace, include_paths=include,
+                                 repos_filter=repos_filter,
+                                 tmux_session=args.tmux_session, dry_run=args.dry_run)
+        exit(1 if any(r['status'] == 'error' for r in results) else 0)
 
     # Handle --update-state mode
     if args.update_state:
