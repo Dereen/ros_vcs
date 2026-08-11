@@ -121,8 +121,9 @@ Status of only the pipeline's repos:
 ```
 
 Import works with the standard command; the pipeline definition is restored to the
-canonical `<workspace>/pipeline/` directory (multiple pipelines coexist there under
-their own filenames — nothing overwrites another), tmuxinator configs are restored to
+canonical `~/.config/ros_vcs/pipeline/` directory — always, not tied to any one
+workspace, the same role `~/.config/tmuxinator/` plays for session configs (multiple
+pipelines coexist there under their own filenames). Tmuxinator configs are restored to
 `<workspace>/tmuxinator/` (add `--install-tmuxinator` to also copy them into
 `~/.config/tmuxinator/`), and `extra_paths` are restored to their original
 workspace-relative locations:

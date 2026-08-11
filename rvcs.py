@@ -77,6 +77,13 @@ __version__ = "1.4.0"
 # every importer passing them by hand.
 COLCON_CONFIG_FILES = ('colcon_defaults.yaml', '.colcon/config.yaml')
 
+# Canonical, workspace-independent home for restored pipeline definitions —
+# same role as ~/.config/tmuxinator/ for tmuxinator configs. Not under any
+# particular output_dir: a pipeline definition describes a slice of a
+# workspace, and belongs in one place regardless of which workspace an
+# import lands in.
+PIPELINE_CONFIG_DIR = os.path.expanduser('~/.config/ros_vcs/pipeline')
+
 # Module-level debug flag (set by CLI)
 _debug = False
 
@@ -1150,9 +1157,10 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
       tmuxinator/* -> <output_dir>/tmuxinator/ (and, with install_tmuxinator,
                       copied into ~/.config/tmuxinator/)
       extra/*      -> <output_dir>/ (workspace-relative non-repo paths)
-      pipeline/*   -> <output_dir>/pipeline/  (the canonical pipeline
-                      directory; older zips carrying a bare 'pipeline.yaml'
-                      member land there too, under that same name)
+      pipeline/*   -> PIPELINE_CONFIG_DIR (~/.config/ros_vcs/pipeline/,
+                      workspace-independent, always installed; older zips
+                      carrying a bare 'pipeline.yaml' member land there too,
+                      under a name recovered from the definition's own key)
 
     Args:
         input_file: Path to .workspace.zip/.pipeline.zip, .repos file, or directory
@@ -1252,12 +1260,14 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                             print(f"  Rewrote {subs} path(s) in {n}: "
                                   f"{export_root} -> {target_root}")
 
-                # Restore pipeline payload into the new workspace. extra/<rel>
-                # entries land at their workspace-relative path; tmuxinator
-                # configs land in <output_dir>/tmuxinator/, pipeline
-                # definitions in the canonical <output_dir>/pipeline/ — so
-                # nothing outside the target is touched without
-                # install_tmuxinator.
+                # Restore pipeline payload. extra/<rel> entries land at their
+                # workspace-relative path; tmuxinator configs land in
+                # <output_dir>/tmuxinator/. Pipeline definitions go straight
+                # to the canonical, workspace-independent PIPELINE_CONFIG_DIR
+                # (like --install-tmuxinator's ~/.config/tmuxinator/ copy,
+                # but unconditional: a pipeline definition has exactly one
+                # home, not a workspace-local staging copy plus an optional
+                # install).
                 for member in pipeline_members:
                     if member.endswith('/'):
                         continue
@@ -1277,7 +1287,10 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                         except Exception:
                             pass
                         fname = f"{pname}.pipeline.yaml" if pname else 'pipeline.yaml'
-                        dest = os.path.join(output_dir, 'pipeline', fname)
+                        dest = os.path.join(PIPELINE_CONFIG_DIR, fname)
+                    elif member.startswith('pipeline/'):
+                        dest = os.path.join(PIPELINE_CONFIG_DIR,
+                                            os.path.relpath(member, 'pipeline'))
                     else:
                         dest = os.path.join(output_dir, member)
                     os.makedirs(os.path.dirname(dest) or output_dir, exist_ok=True)
@@ -1286,7 +1299,7 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
                 pipe_files = [n for n in pipeline_members
                              if n == 'pipeline.yaml' or n.startswith('pipeline/')]
                 if pipe_files:
-                    print(f"  Restored pipeline definition to {os.path.join(output_dir, 'pipeline')}/")
+                    print(f"  Restored pipeline definition to {PIPELINE_CONFIG_DIR}/")
                 tmux_files = [n for n in pipeline_members if n.startswith('tmuxinator/')]
                 if tmux_files:
                     print(f"  Restored tmuxinator configs to {os.path.join(output_dir, 'tmuxinator')}/")
