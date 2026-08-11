@@ -275,6 +275,13 @@ locally but not in the zip are summarized, not flagged. Keys: `j/k` move,
 `l`/`Enter` expand, `h` collapse (again: jump to parent), `J/K`/`PgUp/PgDn`
 scroll the detail pane, `g/G` top/bottom, `q` quit.
 
+The comparison is **content-aware**: a zip-side change you already have —
+its dirty patch committed here since the export, or its untracked file now
+tracked locally with identical content — shows as `=` (`zip change already
+in local` / `already in local, tracked`) instead of a false `+`. A zip
+untracked file that exists here with *different* content shows the real
+diff (`tracked locally, content differs`).
+
 The tree is also a MERGE tool — every action applies to the selected node
 *and everything beneath it*, so it works from a single file up to a whole repo:
 

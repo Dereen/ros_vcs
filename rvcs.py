@@ -1573,15 +1573,37 @@ def _untracked_text(entry):
     return False, content, len(content)
 
 
-def _diff_repo_files(zdirty, ldirty, repo_path=None):
+def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
     """Compare per-file uncommitted changes of one repo between zip and local.
     Returns (child nodes, counts dict). Nodes carry an 'act' payload so the
-    TUI can merge/accept them (repo_path, file, zip patch/content, side)."""
+    TUI can merge/accept them (repo_path, file, zip patch/content, side).
+    Content-aware: a zip-side change that is ALREADY in the local file
+    (e.g. committed here since the export) counts as in sync, not as a diff."""
     zfiles = _split_patch_by_file(zdirty.get('staged', ''))
     zfiles.update(_split_patch_by_file(zdirty.get('unstaged', '')))
     lfiles = _split_patch_by_file(ldirty.get('staged', ''))
     lfiles.update(_split_patch_by_file(ldirty.get('unstaged', '')))
     zun, lun = zdirty.get('untracked', {}), ldirty.get('untracked', {})
+
+    def zip_change_contained(path, zp):
+        """True if the zip's patch for path is already contained in the local
+        file; False when it still brings something (or would conflict); None
+        when undecidable (zip base commit unknown, patch does not apply)."""
+        if not (repo_path and zip_sha):
+            return None
+        base = _git_show_head(repo_path, path, rev=zip_sha)
+        theirs = _apply_patch_to_text(base, zp, path)
+        if theirs is None:
+            return None
+        try:
+            ours = open(os.path.join(repo_path, path),
+                        encoding='utf-8', errors='replace').read()
+        except OSError:
+            return None
+        if ours == theirs:
+            return True
+        merged, n = _merge_texts(ours, base, theirs)
+        return n == 0 and merged == ours
 
     nodes, counts = [], {'+': 0, '-': 0, '~': 0, '=': 0}
     for path in sorted(set(zfiles) | set(lfiles)):
@@ -1600,18 +1622,34 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None):
             nodes[-1]['act'] = act
             continue
         if zp is not None and lp is None:
-            counts['+'] += 1
-            nodes.append(_node(f"{path}  (modified only in zip)", 'added',
-                               ['── patch in zip ──'] + zp.splitlines()))
+            if zip_change_contained(path, zp):
+                counts['='] += 1
+                nodes.append(_node(f"{path}  (zip change already in local)", 'same',
+                                   ["The zip's uncommitted patch is already contained in the",
+                                    'local file (committed or applied here since the export).',
+                                    ''] + zp.splitlines()))
+            else:
+                counts['+'] += 1
+                nodes.append(_node(f"{path}  (modified only in zip)", 'added',
+                                   ['── patch in zip ──'] + zp.splitlines()))
         elif lp is not None and zp is None:
             counts['-'] += 1
             nodes.append(_node(f"{path}  (modified only locally)", 'removed',
                                ['── patch in local workspace ──'] + lp.splitlines()))
         elif zp != lp:
-            counts['~'] += 1
-            nodes.append(_node(f"{path}  (patches differ)", 'changed',
-                               ['── patch in zip ──'] + zp.splitlines() +
-                               ['', '── patch in local workspace ──'] + lp.splitlines()))
+            if zip_change_contained(path, zp):
+                counts['='] += 1
+                nodes.append(_node(f"{path}  (zip change contained; local has own edits)",
+                                   'same',
+                                   ["The zip's patch is already contained in the local file;",
+                                    'the remaining difference is local-only work.',
+                                    '', '── patch in zip ──'] + zp.splitlines() +
+                                   ['', '── patch in local workspace ──'] + lp.splitlines()))
+            else:
+                counts['~'] += 1
+                nodes.append(_node(f"{path}  (patches differ)", 'changed',
+                                   ['── patch in zip ──'] + zp.splitlines() +
+                                   ['', '── patch in local workspace ──'] + lp.splitlines()))
         else:
             counts['='] += 1
             nodes.append(_node(f"{path}  (same patch)", 'same',
@@ -1624,10 +1662,39 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None):
                 'zip_entry': ze, 'local_entry': le}
         if ze is not None and le is None:
             zb, ztext, zsize = _untracked_text(ze)
-            counts['+'] += 1
-            detail = ['── new file, only in zip ──'] + \
-                     (['<binary, %d bytes>' % zsize] if zb else (ztext or '').splitlines())
-            nodes.append(_node(f"{label_path}  (only in zip)", 'added', detail))
+            disk = os.path.join(repo_path, path) if repo_path else None
+            if disk and os.path.exists(disk):
+                # untracked in the zip but existing here (typically committed
+                # since the export) — compare actual content
+                zbytes = base64.b64decode(ze.get('content', '')) if zb \
+                    else (ztext or '').encode()
+                try:
+                    dbytes = open(disk, 'rb').read()
+                except OSError:
+                    dbytes = None
+                if dbytes == zbytes:
+                    counts['='] += 1
+                    nodes.append(_node(f"{label_path}  (already in local, tracked)", 'same',
+                                       ['Untracked in the zip but present here with identical',
+                                        'content (committed since the export).']))
+                else:
+                    import difflib
+                    counts['~'] += 1
+                    if zb or dbytes is None:
+                        detail = ['<binary or unreadable: zip %d bytes, local %s bytes>'
+                                  % (zsize, len(dbytes) if dbytes is not None else '?')]
+                    else:
+                        detail = list(difflib.unified_diff(
+                            dbytes.decode('utf-8', 'replace').splitlines(),
+                            (ztext or '').splitlines(),
+                            'local/' + path, 'zip/' + path, lineterm=''))
+                    nodes.append(_node(f"{label_path}  (tracked locally, content differs)",
+                                       'changed', detail))
+            else:
+                counts['+'] += 1
+                detail = ['── new file, only in zip ──'] + \
+                         (['<binary, %d bytes>' % zsize] if zb else (ztext or '').splitlines())
+                nodes.append(_node(f"{label_path}  (only in zip)", 'added', detail))
         elif le is not None and ze is None:
             lb, ltext, lsize = _untracked_text(le)
             counts['-'] += 1
@@ -1730,7 +1797,8 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         ldirty = {'staged': ldirty.get('staged_diff', ''),
                   'unstaged': ldirty.get('unstaged_diff', ''),
                   'untracked': ldirty.get('untracked_files', {})}
-        file_nodes, fcounts = _diff_repo_files(zdirty, ldirty, repo_path=lpath)
+        file_nodes, fcounts = _diff_repo_files(zdirty, ldirty, repo_path=lpath,
+                                               zip_sha=zsha if cinfo['known'] else None)
         dirty_differs = fcounts['+'] or fcounts['-'] or fcounts['~']
         if cstatus == 'same' and not dirty_differs:
             summary['='] += 1
@@ -1893,13 +1961,13 @@ class _MergeCtx:
         self.results.append(line)
 
 
-def _git_show_head(repo_path, rel_file):
-    """Content of rel_file at local HEAD ('' if the file is new/unknown).
+def _git_show_head(repo_path, rel_file, rev='HEAD'):
+    """Content of rel_file at rev ('' if the file is new/unknown there).
     Raw subprocess on purpose: GitPython's .git.show() strips the trailing
     newline, which breaks patch application and 3-way merges."""
     import subprocess
     try:
-        r = subprocess.run(['git', '-C', repo_path, 'show', f'HEAD:{rel_file}'],
+        r = subprocess.run(['git', '-C', repo_path, 'show', f'{rev}:{rel_file}'],
                            capture_output=True)
         return r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else ''
     except Exception:
@@ -2114,6 +2182,21 @@ def apply_action(node, mode, ctx):
             os.unlink(local_path)
             return _finish(node, 'done', 'removed (not in zip)')
         zb, ztext, _ = _untracked_text(ze)
+        if le is None and mode == 'merge' and not zb and local_path \
+                and os.path.exists(local_path):
+            # zip-untracked but existing here (tracked): merge with disk content
+            try:
+                disk_text = open(local_path, encoding='utf-8', errors='replace').read()
+            except OSError:
+                disk_text = None
+            if disk_text is not None:
+                if disk_text == (ztext or ''):
+                    return _finish(node, 'done', 'already identical')
+                merged, n = _merge_texts(disk_text, '', ztext or '')
+                _write_local(ctx, local_path, merged)
+                if n:
+                    return _finish(node, 'conflict', f'{n} conflict(s) — markers written')
+                return _finish(node, 'done', 'merged with tracked local file')
         if le is None or mode == 'theirs':   # take zip content
             if zb:
                 raw = base64.b64decode(ze.get('content', ''))
