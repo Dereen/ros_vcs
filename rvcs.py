@@ -2370,6 +2370,9 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
       only) so the patch applies onto the base it was made against
     - files changed on BOTH sides are written only when the merge is
       conflict-free; anything conflicting is left untouched and reported
+    - repos strictly behind the zip are fast-forwarded (after fetching the
+      zip's bundle when needed) — a strict ff cannot conflict; diverged
+      repos are reported and left for an explicit merge in the TUI
     - local-only changes are never reverted, nothing is ever deleted
     Returns (applied, skipped, kept, ctx); dry_run writes nothing.
     A caller with its own _MergeCtx (the TUI's u key) can pass it so all
@@ -2527,6 +2530,57 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
                 applied.append(label)
             elif st == 'changed':
                 skipped.append((label, 'differs — pick a side in the TUI (o/t/m)'))
+        elif kind == 'commits':
+            # zip commits already visible locally: a strict fast-forward is
+            # non-conflicting by definition — apply it; diverged repos need
+            # a real merge commit, which stays an explicit decision
+            if st in ('same', 'done'):
+                return
+            if act.get('ahead'):
+                skipped.append((label, 'diverged — merge from the repo node (t)'))
+                return
+            if dry_run:
+                applied.append(f"{label}: fast-forward {act.get('behind')} commit(s)")
+                return
+            note = _merge_zip_commits(node, act)
+            if node['status'] == 'done':
+                applied.append(f"{label}: {note}")
+            else:
+                skipped.append((label, note))
+        elif kind == 'bundle':
+            # fetching a bundle only adds refs — harmless; follow up with a
+            # fast-forward when the local branch is then strictly behind
+            if st in ('same', 'done'):
+                return
+            if dry_run:
+                applied.append(f"{label}: fetch zip bundle (+ fast-forward "
+                               "if strictly behind)")
+                return
+            note = _fetch_bundle(node, act)
+            if node['status'] != 'done':
+                skipped.append((label, note))
+                return
+            applied.append(f"{label}: {note}")
+            try:
+                r = git.Repo(act['repo'])
+                ahead = int(r.git.rev_list('--count', act['zip_sha'] + '..HEAD'))
+                behind = int(r.git.rev_list('--count', 'HEAD..' + act['zip_sha']))
+            except Exception as e:
+                skipped.append((label, f'post-fetch state unknown: {e}'))
+                return
+            if not behind:
+                return
+            if ahead:
+                skipped.append((label, 'diverged — merge from the repo node (t)'))
+                return
+            node['status'] = 'changed'   # let the second action run
+            note = _merge_zip_commits(node, {'repo': act['repo'],
+                                             'zip_sha': act['zip_sha'],
+                                             'ahead': 0, 'behind': behind})
+            if node['status'] == 'done':
+                applied.append(f"{label}: {note}")
+            else:
+                skipped.append((label, note))
 
     def walk(n):
         handle(n)

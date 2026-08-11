@@ -292,7 +292,7 @@ The tree is also a MERGE tool — every action applies to the selected node
 | `t` | accept **theirs** — make the local file(s) match the zip (after y/N confirm) |
 | `m` | 3-way **merge** (base = local HEAD): non-overlapping changes combine, overlaps get `<<<<<<< local` / `>>>>>>> zip` conflict markers written into the file for manual resolution |
 | `M` | merge **all** — the whole tree |
-| `u` | safe batch **update** — apply every non-conflicting zip change (`--update-state` semantics: conflicting files stay untouched and are listed), then walk the leftovers with `o`/`t`/`m`. Applied items stay marked `✓ (applied by update)` across reloads; once nothing differs any more the root node turns `✓ … (fully in sync)` |
+| `u` | safe batch **update** — apply every non-conflicting zip change (`--update-state` semantics: conflicting files stay untouched and are listed), fetch zip bundles, and fast-forward repos that are strictly behind the zip (a strict ff cannot conflict; diverged repos are listed for an explicit `t`). Then walk the leftovers with `o`/`t`/`m`. Applied items stay marked `✓ (applied by update)` across reloads; once nothing differs any more the root node turns `✓ … (nothing left to take)` |
 | `r` | reload the diff from disk (also happens automatically after every action) |
 
 Resolved nodes turn `✓`, conflicted ones `!`. Before the first modification of
@@ -327,7 +327,9 @@ cleanly, refuse everything that doesn't.
 
 Zip-side changes are taken via a true 3-way merge (when the zip HEAD contains
 commits unknown locally, the zip's `bundles/` are fetched — objects only — so
-patches apply onto the base they were made against). A file is written only
+patches apply onto the base they were made against). Repos strictly behind
+the zip are fast-forwarded (a strict ff cannot conflict); diverged repos are
+reported for an explicit merge. A file is written only
 when the merge has zero conflicts and actually changes it. Never touched:
 files where the merge would conflict, files already carrying conflict markers,
 locally-tracked files the zip only has as untracked, binary divergence, and
