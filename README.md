@@ -299,6 +299,12 @@ Resolved nodes turn `✓`, conflicted ones `!`. Before the first modification of
 any file its original is copied to `/tmp/rvcs_merge_backup_<timestamp>/`, and
 the backup path is shown in the root node after every action.
 
+A repo whose history differs from the zip expands into its commit lists —
+`+ commits only in zip`, `- commits only local` — and, when the two have
+diverged, a **merge dry-run** node: which files would conflict (with hunk
+counts) and which auto-merge, computed with `git merge-tree` so nothing is
+written. The same summary appears under `d` on the repo node.
+
 Commit divergence is handled on the **repo** node: when the zip's commits
 exist only in its `bundles/`, `t` first *fetches* the bundle (refs only,
 under `refs/rvcs-bundle/`, working tree untouched); after the automatic

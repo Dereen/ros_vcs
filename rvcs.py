@@ -1758,6 +1758,97 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
     return nodes, counts
 
 
+_MERGE_DRYRUN_CACHE = {}  # (repo, head, zip_sha) -> result dict
+
+
+def _merge_dry_run(repo_path, zip_sha):
+    """Merge HEAD with zip_sha in memory (git merge-tree --write-tree writes
+    only objects, never the branch/worktree) and report which files would
+    conflict and which auto-merge. Returns None when unsupported (git < 2.38).
+    Memoized per (repo, HEAD, zip commit) — reloads are free."""
+    import subprocess
+    try:
+        head = git.Repo(repo_path).head.commit.hexsha
+    except Exception:
+        return None
+    key = (repo_path, head, zip_sha)
+    if key in _MERGE_DRYRUN_CACHE:
+        return _MERGE_DRYRUN_CACHE[key]
+
+    def out(*a):
+        return subprocess.run(['git', '-C', repo_path] + list(a), capture_output=True)
+
+    r = out('merge-tree', '--write-tree', '--name-only', 'HEAD', zip_sha)
+    text = r.stdout.decode('utf-8', 'replace')
+    if not text.strip() or 'usage:' in r.stderr.decode('utf-8', 'replace'):
+        _MERGE_DRYRUN_CACHE[key] = None
+        return None
+    lines = text.splitlines()
+    tree, conflicts = lines[0].strip(), []
+    for line in lines[1:]:
+        if not line.strip():
+            break
+        conflicts.append(line.strip())
+    base = out('merge-base', 'HEAD', zip_sha).stdout.decode().strip()
+    incoming = [f for f in out('diff', '--name-only', base or 'HEAD', zip_sha)
+                .stdout.decode().splitlines() if f] if base else []
+    hunks = {}
+    for f in conflicts[:20]:
+        blob = out('show', f'{tree}:{f}').stdout.decode('utf-8', 'replace')
+        hunks[f] = blob.count('\n<<<<<<<') + blob.startswith('<<<<<<<')
+    res = {'conflicts': conflicts, 'hunks': hunks,
+           'clean': [f for f in incoming if f not in set(conflicts)],
+           'base': base}
+    _MERGE_DRYRUN_CACHE[key] = res
+    return res
+
+
+def _commit_nodes(repo_path, zip_sha, cinfo):
+    """Browsable children for a repo whose history differs from the zip:
+    the two commit lists and — when diverged — what merging would do."""
+    import subprocess
+
+    def log(rng):
+        r = subprocess.run(['git', '-C', repo_path, 'log', '--oneline', rng],
+                           capture_output=True)
+        return [l for l in r.stdout.decode('utf-8', 'replace').splitlines() if l]
+
+    nodes = []
+    if cinfo['behind']:
+        incoming = log(f'HEAD..{zip_sha}')
+        stat = subprocess.run(['git', '-C', repo_path, 'show', '--stat',
+                               '--oneline', zip_sha], capture_output=True)
+        nodes.append(_node(
+            f"commits only in zip ({len(incoming)})", 'added',
+            incoming + ['', '── newest incoming commit ──'] +
+            stat.stdout.decode('utf-8', 'replace').splitlines()[:40]))
+    if cinfo['ahead']:
+        mine = log(f'{zip_sha}..HEAD')
+        nodes.append(_node(f"commits only local ({len(mine)})", 'removed',
+                           ['Your work — the zip has none of it; never touched.',
+                            ''] + mine))
+    if cinfo['behind'] and cinfo['ahead']:
+        dry = _merge_dry_run(repo_path, zip_sha)
+        if dry is not None:
+            c, cl = dry['conflicts'], dry['clean']
+            det = ['Merging the zip commits into your branch would:', '']
+            if c:
+                det.append('CONFLICT — needs hand-resolution (%d file(s)):' % len(c))
+                det += ['    ! %s  (%d hunk(s))' % (f, dry['hunks'].get(f, 0))
+                        for f in c[:20]]
+                det.append('')
+            if cl:
+                det.append('auto-merge cleanly (%d file(s)):' % len(cl))
+                det += ['    ✓ %s' % f for f in cl[:40]]
+            det += ['', 't on the repo node runs this merge; on conflicts it aborts',
+                    'and leaves the repo untouched for a hand merge:',
+                    '', f'    git -C {repo_path} merge {zip_sha[:9]}']
+            label = ('merge dry-run: %d conflicting, %d clean file(s)'
+                     % (len(c), len(cl)))
+            nodes.append(_node(label, 'clash' if c else 'added', det))
+    return nodes
+
+
 def _repo_commit_info(repo_path, zip_sha):
     """Describe how local HEAD relates to the zip's recorded commit.
     Returns (status, detail lines, {'known': bool, 'ahead': int, 'behind': int})."""
@@ -1875,7 +1966,9 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         if dirty_differs:
             bits.append('changes: +%d -%d ~%d' % (fcounts['+'], fcounts['-'], fcounts['~']))
         n = _node(f"{rel}  ({', '.join(bits)})", 'changed', clines)
-        n['children'] = file_nodes
+        n['children'] = (_commit_nodes(lpath, zsha, cinfo)
+                         if cinfo['known'] and (cinfo['behind'] or cinfo['ahead'])
+                         else []) + file_nodes
         bmeta = zm['bundles'].get(rel)
         if cstatus != 'same' and not cinfo['known'] and bmeta:
             n['act'] = {'kind': 'bundle', 'repo': lpath,
@@ -2113,10 +2206,21 @@ def _merge_preview(node):
                 '--oneline', 'HEAD..' + act['zip_sha']).splitlines()[:30]
         except Exception as e:
             lines += [f'(could not list: {e})']
-        lines += ['', ('fast-forward (local has no commits of its own)'
-                       if not act.get('ahead') else
-                       'diverged: t creates a merge commit '
-                       '(%d local vs %d zip commit(s))' % (act['ahead'], act['behind']))]
+        if not act.get('ahead'):
+            lines += ['', 'fast-forward (local has no commits of its own)']
+            return lines
+        lines += ['', 'diverged: t creates a merge commit '
+                  '(%d local vs %d zip commit(s))' % (act['ahead'], act['behind'])]
+        dry = _merge_dry_run(act['repo'], act['zip_sha'])
+        if dry is not None:
+            lines += ['', '── merge dry-run (nothing written) ──']
+            if dry['conflicts']:
+                lines += ['CONFLICT (%d file(s)):' % len(dry['conflicts'])]
+                lines += ['    ! %s  (%d hunk(s))' % (f, dry['hunks'].get(f, 0))
+                          for f in dry['conflicts'][:20]]
+            if dry['clean']:
+                lines += ['auto-merge cleanly (%d file(s)):' % len(dry['clean'])]
+                lines += ['    ✓ %s' % f for f in dry['clean'][:40]]
         return lines
     if act.get('kind') == 'patch' and act.get('zip_patch'):
         base_rev = act.get('zip_sha') or 'HEAD'
