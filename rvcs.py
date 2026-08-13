@@ -3963,6 +3963,14 @@ Examples:
         if args.compare or args.json or args.import_state:
             print("Cannot use other options with --export-state")
             exit(1)
+        if args.pipeline:
+            # `rvcs <name> --export-state` / `--pipeline X --export-state`:
+            # exporting "the state" of a pipeline IS a pipeline export — slice
+            # to its repos and carry the definition + tmuxinator configs.
+            # Without this, the bare-name shortcut had nulled args.workspace
+            # and this would silently export the CWD as a full workspace.
+            export_pipeline_state(args.pipeline, workspace_path=args.workspace)
+            exit(0)
         workspace = args.workspace if args.workspace else os.getcwd()
         ignore = load_ignore_packages(args.ignore) if args.ignore else None
         if ignore:
