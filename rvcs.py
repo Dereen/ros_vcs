@@ -296,6 +296,132 @@ def commit_pipeline_snapshot(name, content_bytes, message, author_date=None):
                           capture_output=True, text=True).stdout.strip()
 
 
+def _workspace_packages(source_folder, repos):
+    """{package_name: repo_rel} for every ROS package under source_folder.
+    repos is the {rel: abs} map the caller already built; a package belongs to
+    the LONGEST repo path containing it (nested repos win)."""
+    pkgs = {}
+    abs_repos = sorted(((os.path.abspath(a), rel) for rel, a in repos.items()),
+                       key=lambda t: -len(t[0]))
+    for root, dirs, files in os.walk(source_folder):
+        # '.claude/worktrees/*' holds extra CHECKOUTS of repos already here --
+        # same package names at other commits. Scanning them makes a package
+        # resolve to a stale copy whose package.xml can miss dependencies
+        # (exactly how the norlab_icp_mapper_ros dep hid from this check).
+        dirs[:] = [d for d in dirs
+                   if d not in ('.git', '.claude', 'build', 'install', 'log')]
+        if 'package.xml' not in files:
+            continue
+        try:
+            import xml.etree.ElementTree as ET
+            tree = ET.parse(os.path.join(root, 'package.xml'))
+            name = (tree.find('name').text or '').strip()
+        except Exception:
+            continue
+        if not name:
+            continue
+        ap = os.path.abspath(root)
+        for repo_abs, rel in abs_repos:
+            if ap == repo_abs or ap.startswith(repo_abs + os.sep):
+                pkgs[name] = rel
+                break
+    return pkgs
+
+
+_DEP_TAGS = ('depend', 'build_depend', 'buildtool_depend', 'exec_depend',
+             'run_depend', 'test_depend', 'build_export_depend',
+             'buildtool_export_depend')
+
+
+def _package_deps(pkg_dir):
+    """Dependency package names declared in pkg_dir/package.xml."""
+    import xml.etree.ElementTree as ET
+    out = set()
+    try:
+        root = ET.parse(os.path.join(pkg_dir, 'package.xml')).getroot()
+    except Exception:
+        return out
+    for tag in _DEP_TAGS:
+        for el in root.findall(tag):
+            if el.text and el.text.strip():
+                out.add(el.text.strip())
+    return out
+
+
+def check_pipeline_closure(workspace, include_paths):
+    """Warn when a package INSIDE the slice depends on a workspace package
+    whose repo is OUTSIDE it -- the restored slice would then fail to build or
+    launch, which no amount of correct exporting can fix. Dependencies not
+    present in the workspace at all are ignored: those are system/rosdep
+    packages the importer installs normally. Repos carrying commits no remote
+    has are called out extra loudly, since 'just clone it' cannot recover them.
+    Returns a list of (dependent_pkg, missing_pkg, missing_repo, forked: bool)."""
+    source_folder = os.path.join(workspace, 'src')
+    if not os.path.isdir(source_folder):
+        source_folder = workspace
+    repos = {os.path.relpath(p, source_folder): p for p in find_git_repos(source_folder)}
+    pkgs = _workspace_packages(source_folder, repos)
+    # package -> its directory, for reading deps
+    pkg_dirs = {}
+    for root, dirs, files in os.walk(source_folder):
+        dirs[:] = [d for d in dirs
+                   if d not in ('.git', '.claude', 'build', 'install', 'log')]
+        if 'package.xml' in files:
+            try:
+                import xml.etree.ElementTree as ET
+                n = (ET.parse(os.path.join(root, 'package.xml')).find('name').text or '').strip()
+                if n:
+                    pkg_dirs[n] = root
+            except Exception:
+                pass
+
+    def repo_included(rel):
+        return repo_in_include_paths(rel, include_paths)
+
+    problems = []
+    for pkg, repo_rel in sorted(pkgs.items()):
+        if not repo_included(repo_rel):
+            continue
+        for dep in sorted(_package_deps(pkg_dirs.get(pkg, ''))):
+            dep_repo = pkgs.get(dep)
+            if dep_repo is None or repo_included(dep_repo):
+                continue
+            forked = False
+            try:
+                r = git.Repo(repos[dep_repo])
+                forked = bool(r.git.log('--oneline', '--branches', '--not', '--remotes'))
+            except Exception:
+                pass
+            problems.append((pkg, dep, dep_repo, forked))
+    return problems
+
+
+def report_pipeline_closure(workspace, include_paths):
+    """Print check_pipeline_closure's findings. Returns True if all clean."""
+    try:
+        problems = check_pipeline_closure(workspace, include_paths)
+    except Exception as e:
+        print(f"  (dependency check skipped: {e})")
+        return True
+    if not problems:
+        return True
+    print("\nWARNING: packages in this pipeline depend on repos NOT in it -- a")
+    print("restored slice will fail to build/launch until they are added:")
+    seen = set()
+    for pkg, dep, dep_repo, forked in problems:
+        key = (dep, dep_repo)
+        if key in seen:
+            continue
+        seen.add(key)
+        who = sorted({p for p, d, _, _ in problems if d == dep})
+        note = ('  <-- has commits NO REMOTE has: cloning it does not recover them'
+                if forked else '')
+        print(f"  ! {dep}  (repo: {dep_repo}){note}")
+        print(f"      needed by: {', '.join(who)}")
+    print("  Add the repo(s) to the pipeline's `repos:` list.\n")
+    return False
+
+
 def repo_in_include_paths(rel_path, include_paths):
     """
     True if a repo (path relative to src/) is selected by an include list.
@@ -905,6 +1031,10 @@ def export_pipeline_state(pipeline_file, workspace_path=None, output_dir=None):
     for entry in pipeline['repos']:
         if not any(repo_in_include_paths(rel, [entry]) for rel in found):
             print(f"Warning: pipeline repo entry matches nothing in {source_folder}: {entry}")
+
+    # Does the slice actually stand on its own? (the check that would have
+    # caught marv_perception and the norlab_icp_mapper_ros fork being dropped)
+    report_pipeline_closure(workspace, pipeline['repos'] or None)
 
     return export_workspace_state(
         workspace,
@@ -4230,10 +4360,11 @@ Examples:
     parser.add_argument('-j', '--json', action='store_true', help='Save results to JSON file')
     parser.add_argument('-c', '--compare', help='Compare with JSON file')
     parser.add_argument('--export-state', action='store_true', help='Export workspace state to zip')
-    parser.add_argument('--export-pipeline', metavar='PIPELINE',
+    parser.add_argument('--export-pipeline', metavar='PIPELINE', nargs='?', const='',
                         help='Export a pipeline slice incl. tmuxinator configs — a '
                              '.pipeline.yaml path, or a stored pipeline NAME '
-                             '(see --list-pipelines)')
+                             '(see --list-pipelines). Value optional: '
+                             '`rvcs <name> --export-pipeline` exports that pipeline.')
     parser.add_argument('--pipeline', metavar='PIPELINE',
                         help='Restrict status/compare to the repos of a pipeline — a '
                              '.pipeline.yaml path, or a stored pipeline NAME')
@@ -4506,11 +4637,20 @@ Examples:
         exit(0)
 
     # Handle --export-pipeline mode
-    if args.export_pipeline:
+    if args.export_pipeline is not None:
         if args.compare or args.json or args.import_state or args.export_state:
             print("Cannot use other options with --export-pipeline")
             exit(1)
-        export_pipeline_state(args.export_pipeline, workspace_path=args.workspace)
+        # bare `--export-pipeline` (no value): use the pipeline named by the
+        # positional/--pipeline, e.g. `rvcs flipper_eval --export-pipeline`
+        target = args.export_pipeline or args.pipeline
+        if not target:
+            print('--export-pipeline needs a pipeline: a .pipeline.yaml path, a '
+                  'stored NAME, or `rvcs <name> --export-pipeline`.')
+            known = list_pipeline_names()
+            print('Known pipelines: ' + (', '.join(known) if known else '(none)'))
+            exit(1)
+        export_pipeline_state(target, workspace_path=args.workspace)
         exit(0)
 
     # Handle --export-state mode
