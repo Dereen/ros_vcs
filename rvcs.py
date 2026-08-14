@@ -3883,10 +3883,11 @@ Examples:
     parser.add_argument('-j', '--json', action='store_true', help='Save results to JSON file')
     parser.add_argument('-c', '--compare', help='Compare with JSON file')
     parser.add_argument('--export-state', action='store_true', help='Export workspace state to zip')
-    parser.add_argument('--export-pipeline', metavar='PIPELINE',
+    parser.add_argument('--export-pipeline', metavar='PIPELINE', nargs='?', const='',
                         help='Export a pipeline slice incl. tmuxinator configs — a '
                              '.pipeline.yaml path, or a stored pipeline NAME '
-                             '(see --list-pipelines)')
+                             '(see --list-pipelines). Value optional: '
+                             '`rvcs <name> --export-pipeline` exports that pipeline.')
     parser.add_argument('--pipeline', metavar='PIPELINE',
                         help='Restrict status/compare to the repos of a pipeline — a '
                              '.pipeline.yaml path, or a stored pipeline NAME')
@@ -4128,11 +4129,20 @@ Examples:
         exit(0)
 
     # Handle --export-pipeline mode
-    if args.export_pipeline:
+    if args.export_pipeline is not None:
         if args.compare or args.json or args.import_state or args.export_state:
             print("Cannot use other options with --export-pipeline")
             exit(1)
-        export_pipeline_state(args.export_pipeline, workspace_path=args.workspace)
+        # bare `--export-pipeline` (no value): use the pipeline named by the
+        # positional/--pipeline, e.g. `rvcs flipper_eval --export-pipeline`
+        target = args.export_pipeline or args.pipeline
+        if not target:
+            print('--export-pipeline needs a pipeline: a .pipeline.yaml path, a '
+                  'stored NAME, or `rvcs <name> --export-pipeline`.')
+            known = list_pipeline_names()
+            print('Known pipelines: ' + (', '.join(known) if known else '(none)'))
+            exit(1)
+        export_pipeline_state(target, workspace_path=args.workspace)
         exit(0)
 
     # Handle --export-state mode
