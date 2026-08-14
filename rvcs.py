@@ -1698,6 +1698,42 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
 # workspace, browsable as a tree in a curses TUI (rvcs --diff-state ZIP [ws]).
 # ---------------------------------------------------------------------------
 
+def make_upstream_state_zip(workspace, include_paths=None):
+    """Synthesize a minimal snapshot zip whose recorded state is each repo's
+    UPSTREAM (origin/<branch>; HEAD when no upstream is configured) with no
+    dirty payload. Diffing the live workspace against it shows exactly the
+    LOCAL delta: unpushed commits as '^ local ahead', uncommitted files as
+    local-only changes, and (after --fetch) new remote commits as takeable.
+    This is what --diff-state does when invoked WITHOUT a zip. Returns the
+    zip path inside its own temp dir (caller removes the dir when done)."""
+    source = os.path.join(workspace, 'src')
+    if not os.path.isdir(source):
+        source = workspace
+    repos = {}
+    for path in find_git_repos(source):
+        rel = os.path.relpath(path, source)
+        if not repo_in_include_paths(rel, include_paths):
+            continue
+        try:
+            r = git.Repo(path)
+            url = list(r.remotes.origin.urls)[0] if 'origin' in r.remotes else ''
+            up = _repo_upstream(path)
+            ver = r.commit(up[1]).hexsha if up else r.head.commit.hexsha
+        except Exception:
+            continue
+        repos[rel] = {'type': 'git', 'url': url, 'version': ver}
+    tmp = tempfile.mkdtemp(prefix='rvcs_upstreamdiff_')
+    zpath = os.path.join(tmp, 'upstream-state.zip')
+    with zipfile.ZipFile(zpath, 'w') as zf:
+        zf.writestr('workspace.repos', yaml.safe_dump({'repositories': repos}))
+        zf.writestr('workspace.state.yaml', yaml.safe_dump({
+            'workspace_name': 'upstream state (synthesized -- no zip given)',
+            'export_date': datetime.now().strftime('%Y-%m-%d_%H-%M-%S'),
+            'workspace_root': os.path.abspath(workspace),
+            'dirty_repos': {}}))
+    return zpath
+
+
 def load_state_zip(zip_path):
     """Parse an export zip into {name, date, repos, dirty, bundles, colcon,
     tmuxinator, extra}. Diff payloads are base64-decoded to text."""
@@ -3774,9 +3810,13 @@ Examples:
     parser.add_argument('--list-pipelines', action='store_true',
                         help='List pipelines stored under ~/.config/ros_vcs/pipeline '
                              '(each in its own git repo, one commit per imported snapshot)')
-    parser.add_argument('--diff-state', metavar='ZIP',
+    parser.add_argument('--diff-state', metavar='ZIP', nargs='?', const='',
                         help='Diff an exported .workspace.zip/.pipeline.zip against a live '
-                             'workspace, browsable as a tree (curses TUI on a terminal)')
+                             'workspace, browsable as a tree (curses TUI on a terminal). '
+                             'WITHOUT a zip: diff against each repo\'s upstream instead -- '
+                             'unpushed commits, uncommitted files, and (after --fetch) '
+                             'incoming remote commits. Put the flag last, or its value '
+                             'swallows the next argument.')
     parser.add_argument('--no-tui', action='store_true',
                         help='With --diff-state: print the tree instead of the interactive TUI')
     parser.add_argument('--diff-json', metavar='FILE',
@@ -3946,10 +3986,17 @@ Examples:
         exit(0)
 
     # Handle --diff-state mode
-    if args.diff_state:
+    if args.diff_state is not None:
         if args.compare or args.json or args.import_state or args.export_state or args.export_pipeline:
             print("Cannot use other options with --diff-state")
             exit(1)
+        # `rvcs --diff-state flipper_eval` -- nargs='?' swallowed the pipeline
+        # name as the zip value; recognize a stored name and shift it over
+        if args.diff_state and not os.path.exists(os.path.expanduser(args.diff_state)) \
+                and os.sep not in args.diff_state and not args.pipeline \
+                and args.diff_state in list_pipeline_names():
+            args.pipeline = pipeline_source_path(args.diff_state)
+            args.diff_state = ''
         include = None
         workspace = args.workspace
         if args.pipeline:
@@ -3958,7 +4005,14 @@ Examples:
             if workspace is None:
                 workspace = p.get('workspace')
         workspace = workspace or os.getcwd()
-        zip_arg = os.path.expanduser(args.diff_state)
+        tmp_state = None
+        if args.diff_state:
+            zip_arg = os.path.expanduser(args.diff_state)
+        else:
+            zip_arg = make_upstream_state_zip(workspace, include_paths=include)
+            tmp_state = os.path.dirname(zip_arg)
+            print('No zip given -- diffing against each repo\'s upstream '
+                  '(run --fetch first for fresh remote refs).')
         root = compute_state_diff(zip_arg, workspace, include_paths=include)
         if args.diff_json:
             payload = json.dumps(diff_tree_to_json(root, zip_arg, workspace), indent=2)
@@ -3976,6 +4030,8 @@ Examples:
                                                             include_paths=include),
                          updater=lambda c: update_workspace_state(
                              zip_arg, workspace, include_paths=include, ctx=c))
+        if tmp_state:
+            shutil.rmtree(tmp_state, ignore_errors=True)
         exit(0)
 
     # Handle --export-pipeline mode
