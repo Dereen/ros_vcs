@@ -2340,10 +2340,26 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         zentry = zrepos.get(rel)
         lpath = local_repos.get(rel)
         if lpath is None:
+            # Present in the zip, absent here: the ONLY fix is a clone, so the
+            # node carries one. Without this, --update-state silently did
+            # nothing for missing repos -- the workspace stayed broken and the
+            # summary said 'Applied (0)' (how a colleague ended up without the
+            # norlab_icp_mapper_ros fork after updating from a zip).
             summary['+'] += 1
+            bmeta = zm['bundles'].get(rel)
             det = [f"In the zip but not in the local workspace.",
-                   f"url: {zentry.get('url')}", f"version: {zentry.get('version')}"]
-            repos_sec['children'].append(_node(f"{rel}  (only in zip)", 'added', det))
+                   f"url: {zentry.get('url')}", f"version: {zentry.get('version')}",
+                   '',
+                   't/m (or u) CLONES it here and checks out that commit'
+                   + (' (its commits come from the zip bundle: no remote has them)'
+                      if bmeta else '') + '.']
+            n = _node(f"{rel}  (only in {_SIDE}: not cloned here)", 'added', det)
+            n['act'] = {'kind': 'clone', 'rel': rel,
+                        'dest': os.path.join(source_folder, rel),
+                        'url': zentry.get('url'), 'version': str(zentry.get('version') or ''),
+                        'zip': os.path.abspath(zip_path),
+                        'bundle': bmeta['file'] if bmeta else None}
+            repos_sec['children'].append(n)
             continue
         zsha = str(zentry.get('version') or '')
         cstatus, clines, cinfo = _repo_commit_info(lpath, zsha)
@@ -2903,6 +2919,63 @@ def _dirty_preserving_ff(repo, sha, ctx=None, allow_delete=False, label='zip',
     return True, note
 
 
+def _clone_missing_repo(node, act):
+    """Clone a repo the snapshot has and the workspace lacks, then check out
+    the recorded commit -- fetching the zip's bundle first when that commit
+    exists on no remote. Never touches anything that already exists on disk."""
+    import subprocess
+    dest, url, ver = act['dest'], act.get('url'), act.get('version')
+    if os.path.exists(dest):
+        return _finish(node, 'conflict', 'destination already exists -- not touching it')
+    if not url:
+        return _finish(node, 'conflict', 'no url recorded in the snapshot')
+    os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
+    r = subprocess.run(['git', 'clone', '--quiet', url, dest], capture_output=True)
+    if r.returncode != 0:
+        err = r.stderr.decode('utf-8', 'replace').strip().splitlines()
+        return _finish(node, 'conflict', 'clone failed: %s' % (err[-1] if err else '?'))
+    have = ver and subprocess.run(['git', '-C', dest, 'cat-file', '-e', ver],
+                                  capture_output=True).returncode == 0
+    if ver and not have and act.get('bundle'):
+        try:
+            with zipfile.ZipFile(act['zip']) as zf, \
+                 tempfile.NamedTemporaryFile(suffix='.bundle') as tf:
+                tf.write(zf.read(act['bundle']))
+                tf.flush()
+                subprocess.run(['git', '-C', dest, 'fetch', '--no-write-fetch-head',
+                                tf.name, '+refs/heads/*:refs/rvcs-bundle/*'],
+                               capture_output=True)
+                subprocess.run(['git', '-C', dest, 'fetch', '--no-write-fetch-head',
+                                tf.name, 'HEAD'], capture_output=True)
+            have = subprocess.run(['git', '-C', dest, 'cat-file', '-e', ver],
+                                  capture_output=True).returncode == 0
+        except Exception as e:
+            return _finish(node, 'conflict', f'cloned, but bundle fetch failed: {e}')
+    if ver and not have:
+        return _finish(node, 'conflict',
+                       'cloned, but commit %s is on no remote and no bundle carries it'
+                       % ver[:9])
+    if ver:
+        c = subprocess.run(['git', '-C', dest, 'checkout', '--quiet', '--detach', ver],
+                           capture_output=True)
+        if c.returncode != 0:
+            return _finish(node, 'conflict', 'cloned, but checkout of %s failed' % ver[:9])
+        # land on a real branch when the commit is the tip of one
+        for br in subprocess.run(['git', '-C', dest, 'branch', '-a', '--contains', ver,
+                                  '--format=%(refname:short)'],
+                                 capture_output=True, text=True).stdout.split():
+            if br.startswith('rvcs-bundle/') or br == 'HEAD':
+                continue
+            local = br.split('/')[-1]
+            if subprocess.run(['git', '-C', dest, 'rev-parse', '--verify', '-q',
+                               f'{br}^{{commit}}'], capture_output=True).stdout.decode().strip() \
+                    .startswith(ver[:7]):
+                subprocess.run(['git', '-C', dest, 'checkout', '-B', local, ver, '--quiet'],
+                               capture_output=True)
+                break
+    return _finish(node, 'done', 'cloned at %s' % (ver[:9] if ver else 'default HEAD'))
+
+
 def _merge_zip_commits(node, act, ctx=None, allow_delete=False):
     """Merge the zip's commits into the local branch. Fast-forward when the
     local repo is strictly behind (preserving dirty files that already
@@ -2957,6 +3030,11 @@ def apply_action(node, mode, ctx):
             return _finish(node, 'done', 'kept local')
         _write_local(ctx, act['local_path'], act['zip_text'])
         return _finish(node, 'done', f'took {_SIDE} version')
+
+    if kind == 'clone':
+        if mode == 'ours':
+            return _finish(node, 'done', 'left absent')
+        return _clone_missing_repo(node, act)
 
     if kind == 'bundle':
         if mode == 'ours':
@@ -3270,6 +3348,18 @@ def update_workspace_state(zip_path, workspace, include_paths=None, dry_run=Fals
                 applied.append(f"{label}: {note}")
             else:
                 skipped.append((label, note))
+        elif kind == 'clone':
+            # a repo the workspace simply does not have: cloning conflicts
+            # with nothing, so the safe batch update does it
+            if st in ('same', 'done'):
+                return
+            if dry_run:
+                applied.append(f"{label}: would clone {act.get('url')} @ "
+                               f"{(act.get('version') or '')[:9]}")
+                return
+            note = _clone_missing_repo(node, act)
+            (applied if node['status'] == 'done' else skipped).append(
+                f"{label}: {note}" if node['status'] == 'done' else (label, note))
         elif kind == 'bundle':
             # fetching a bundle only adds refs — harmless; follow up with a
             # fast-forward when the local branch is then strictly behind
@@ -3485,6 +3575,8 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             here = '(conflict: edit the file, then r)'
         elif st == 'same':
             here = '(in sync)'
+        elif kind == 'clone':
+            here = 't/m clone missing repo   o leave absent'
         elif kind == 'bundle':
             here = 't/m fetch (bundle)   o skip'
         elif kind == 'commits':
