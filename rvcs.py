@@ -164,15 +164,31 @@ def _pipeline_repo_dir(name):
     return os.path.join(PIPELINE_CONFIG_DIR, name)
 
 
+def _pipeline_yaml_basename(name):
+    """The definition file inside a pipeline's store repo. Canonically
+    <name>.pipeline.yaml, but the DIRECTORY name is the identity the CLI
+    uses — a user renaming the directory must not orphan the store — so
+    fall back to whatever single *.pipeline.yaml the repo carries."""
+    d = _pipeline_repo_dir(name)
+    exact = f'{name}.pipeline.yaml'
+    if os.path.isfile(os.path.join(d, exact)):
+        return exact
+    cands = sorted(f for f in os.listdir(d) if f.endswith(('.pipeline.yaml',
+                                                           '.pipeline.yml'))) \
+        if os.path.isdir(d) else []
+    return cands[0] if cands else exact
+
+
 def _pipeline_file_in_repo(name):
-    return os.path.join(_pipeline_repo_dir(name), f'{name}.pipeline.yaml')
+    return os.path.join(_pipeline_repo_dir(name), _pipeline_yaml_basename(name))
 
 
 def list_pipeline_names():
     """Names of every pipeline in the canonical store — one git repo per
-    name under PIPELINE_CONFIG_DIR. Directories without a .git (or without
-    their own <name>.pipeline.yaml) are not pipelines; skipped rather than
-    erroring, so stray files don't break listing."""
+    DIRECTORY under PIPELINE_CONFIG_DIR (the directory name is the CLI
+    name, surviving renames). Directories without a .git or without any
+    *.pipeline.yaml are not pipelines; skipped rather than erroring, so
+    stray files don't break listing."""
     if not os.path.isdir(PIPELINE_CONFIG_DIR):
         return []
     names = []
@@ -210,7 +226,8 @@ def pipeline_source_path(name):
         hint = ('Known pipelines: ' + ', '.join(known)) if known else \
                f'No pipelines stored yet under {PIPELINE_CONFIG_DIR}.'
         raise FileNotFoundError(f"No pipeline named '{name}' and no such file. {hint}")
-    r = subprocess.run(['git', '-C', repo_dir, 'show', f'HEAD:{name}.pipeline.yaml'],
+    r = subprocess.run(['git', '-C', repo_dir, 'show',
+                        f'HEAD:{_pipeline_yaml_basename(name)}'],
                        capture_output=True)
     if r.returncode != 0:
         raise FileNotFoundError(
@@ -243,15 +260,27 @@ def commit_pipeline_snapshot(name, content_bytes, message, author_date=None):
     was actually exported, not when it happened to be imported; None uses
     now. Returns the short commit hash, or None if nothing changed."""
     import subprocess
-    repo_dir = _pipeline_repo_dir(name)
-    dest = _pipeline_file_in_repo(name)
+    target = name
+    if not os.path.isdir(_pipeline_repo_dir(name)):
+        # a renamed store dir keeps its identity: if some existing pipeline's
+        # definition declares this name, version there instead of forking a
+        # fresh directory next to it
+        for n in list_pipeline_names():
+            try:
+                if load_pipeline(_pipeline_file_in_repo(n)).get('name') == name:
+                    target = n
+                    break
+            except Exception:
+                continue
+    repo_dir = _pipeline_repo_dir(target)
+    dest = _pipeline_file_in_repo(target)
     os.makedirs(repo_dir, exist_ok=True)
     if not os.path.isdir(os.path.join(repo_dir, '.git')):
         subprocess.run(['git', 'init', '-q', '-b', 'main', repo_dir], check=True)
     with open(dest, 'wb') as f:
         f.write(content_bytes)
     ident = _git_identity_args(repo_dir)
-    subprocess.run(['git', '-C', repo_dir, 'add', f'{name}.pipeline.yaml'], check=True)
+    subprocess.run(['git', '-C', repo_dir, 'add', os.path.basename(dest)], check=True)
     if subprocess.run(['git', '-C', repo_dir, 'diff', '--cached', '--quiet']).returncode == 0:
         return None   # identical to HEAD (or an empty repo with nothing staged) -- no-op
     env = dict(os.environ)
@@ -336,8 +365,28 @@ def get_git_info_dict(folder, debug=False):
         is_dirty = repo.is_dirty(untracked_files=True)
         local_changes = "yes" if is_dirty else "no"
 
-        # Remote changes (for comparison tool, means changes on remote PC, not git remote)
+        # Remote changes: the LOCAL BRANCH vs its upstream tracking ref --
+        # purely local (uses the last fetch, no network). 'N to merge' =
+        # fetched-but-not-merged commits sitting on origin/<branch>; 'N to
+        # push' = local commits the remote lacks. (The compare tool overwrites
+        # this column with its own remote-PC meaning, as before.)
         remote_changes = "no"
+        try:
+            tb = repo.active_branch.tracking_branch()
+            if tb is not None:
+                behind = int(repo.git.rev_list('--count',
+                             f'{repo.active_branch.name}..{tb.name}') or 0)
+                ahead = int(repo.git.rev_list('--count',
+                            f'{tb.name}..{repo.active_branch.name}') or 0)
+                bits = []
+                if behind:
+                    bits.append(f'{behind} to merge')
+                if ahead:
+                    bits.append(f'{ahead} to push')
+                if bits:
+                    remote_changes = ', '.join(bits)
+        except Exception:
+            pass
 
         _debug_print(f"Local changes: {local_changes}")
 
@@ -1698,6 +1747,42 @@ def import_workspace_state(input_file, output_dir, state_file=None, install_tmux
 # workspace, browsable as a tree in a curses TUI (rvcs --diff-state ZIP [ws]).
 # ---------------------------------------------------------------------------
 
+def make_upstream_state_zip(workspace, include_paths=None):
+    """Synthesize a minimal snapshot zip whose recorded state is each repo's
+    UPSTREAM (origin/<branch>; HEAD when no upstream is configured) with no
+    dirty payload. Diffing the live workspace against it shows exactly the
+    LOCAL delta: unpushed commits as '^ local ahead', uncommitted files as
+    local-only changes, and (after --fetch) new remote commits as takeable.
+    This is what --diff-state does when invoked WITHOUT a zip. Returns the
+    zip path inside its own temp dir (caller removes the dir when done)."""
+    source = os.path.join(workspace, 'src')
+    if not os.path.isdir(source):
+        source = workspace
+    repos = {}
+    for path in find_git_repos(source):
+        rel = os.path.relpath(path, source)
+        if not repo_in_include_paths(rel, include_paths):
+            continue
+        try:
+            r = git.Repo(path)
+            url = list(r.remotes.origin.urls)[0] if 'origin' in r.remotes else ''
+            up = _repo_upstream(path)
+            ver = r.commit(up[1]).hexsha if up else r.head.commit.hexsha
+        except Exception:
+            continue
+        repos[rel] = {'type': 'git', 'url': url, 'version': ver}
+    tmp = tempfile.mkdtemp(prefix='rvcs_upstreamdiff_')
+    zpath = os.path.join(tmp, 'upstream (origin refs)')
+    with zipfile.ZipFile(zpath, 'w') as zf:
+        zf.writestr('workspace.repos', yaml.safe_dump({'repositories': repos}))
+        zf.writestr('workspace.state.yaml', yaml.safe_dump({
+            'workspace_name': 'upstream state (synthesized -- no zip given)',
+            'export_date': datetime.now().strftime('%Y-%m-%d_%H-%M-%S'),
+            'workspace_root': os.path.abspath(workspace),
+            'dirty_repos': {}}))
+    return zpath
+
+
 def load_state_zip(zip_path):
     """Parse an export zip into {name, date, repos, dirty, bundles, colcon,
     tmuxinator, extra}. Diff payloads are base64-decoded to text."""
@@ -1840,22 +1925,22 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             state = zip_change_state(path, zp)
             if state == 'contained':
                 counts['='] += 1
-                nodes.append(_node(f"{path}  (zip change already in local)", 'same',
-                                   ["The zip's uncommitted patch is already contained in the",
+                nodes.append(_node(f"{path}  ({_SIDE} change already in local)", 'same',
+                                   [f"The {_SIDE}'s uncommitted patch is already contained in the",
                                     'local file (committed or applied here since the export).',
                                     ''] + zp.splitlines()))
             elif state == 'conflict':
                 counts['~'] += 1
-                nodes.append(_node(f"{path}  (zip change CONFLICTS with local version)",
+                nodes.append(_node(f"{path}  ({_SIDE} change CONFLICTS with local version)",
                                    'clash',
-                                   ["The zip's patch collides with changes made here since the",
+                                   [f"The {_SIDE}'s patch collides with changes made here since the",
                                     'export — u skips this file. d previews the merge with',
                                     'markers; then m (merge), o (keep local) or t (zip version).',
                                     '', '── patch in zip ──'] + zp.splitlines()))
             else:
                 counts['+'] += 1
-                nodes.append(_node(f"{path}  (modified only in zip)", 'added',
-                                   ['── patch in zip ──'] + zp.splitlines()))
+                nodes.append(_node(f"{path}  (modified only in {_SIDE})", 'added',
+                                   [f'── patch in {_SIDE} ──'] + zp.splitlines()))
         elif lp is not None and zp is None:
             counts['-'] += 1
             nodes.append(_node(f"{path}  (modified only locally)", 'removed',
@@ -1864,9 +1949,9 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             state = zip_change_state(path, zp)
             if state == 'contained':
                 counts['='] += 1
-                nodes.append(_node(f"{path}  (zip change contained; local has own edits)",
+                nodes.append(_node(f"{path}  ({_SIDE} change contained; local has own edits)",
                                    'same',
-                                   ["The zip's patch is already contained in the local file;",
+                                   [f"The {_SIDE}'s patch is already contained in the local file;",
                                     'the remaining difference is local-only work.',
                                     '', '── patch in zip ──'] + zp.splitlines() +
                                    ['', '── patch in local workspace ──'] + lp.splitlines()))
@@ -1922,7 +2007,7 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
                 counts['+'] += 1
                 detail = ['── new file, only in zip ──'] + \
                          (['<binary, %d bytes>' % zsize] if zb else (ztext or '').splitlines())
-                nodes.append(_node(f"{label_path}  (only in zip)", 'added', detail))
+                nodes.append(_node(f"{label_path}  (only in {_SIDE})", 'added', detail))
         elif le is not None and ze is None:
             lb, ltext, lsize = _untracked_text(le)
             counts['-'] += 1
@@ -2035,19 +2120,19 @@ def _commit_nodes(repo_path, zip_sha, cinfo):
         stat = subprocess.run(['git', '-C', repo_path, 'show', '--stat',
                                '--oneline', zip_sha], capture_output=True)
         nodes.append(_node(
-            f"commits only in zip ({len(incoming)})", 'added',
+            f"commits only in {_SIDE} ({len(incoming)})", 'added',
             incoming + ['', '── newest incoming commit ──'] +
             stat.stdout.decode('utf-8', 'replace').splitlines()[:40]))
     if cinfo['ahead']:
         mine = log(f'{zip_sha}..HEAD')
         nodes.append(_node(f"commits only local ({len(mine)})", 'ahead',
-                           ['Your work — the zip has none of it; never touched.',
+                           [f'Your work — the {_SIDE} has none of it; never touched.',
                             ''] + mine))
     if cinfo['behind'] and cinfo['ahead']:
         dry = _merge_dry_run(repo_path, zip_sha)
         if dry is not None:
             c, cl = dry['conflicts'], dry['clean']
-            det = ['Merging the zip commits into your branch would:', '']
+            det = [f'Merging the {_SIDE} commits into your branch would:', '']
             if c:
                 det.append('CONFLICT — needs hand-resolution (%d file(s)):' % len(c))
                 det += ['    ! %s  (%d hunk(s))' % (f, dry['hunks'].get(f, 0))
@@ -2079,21 +2164,21 @@ def _repo_commit_info(repo_path, zip_sha):
         try:
             repo.commit(zip_sha)  # is the zip commit known locally?
         except Exception:
-            lines.append("zip HEAD %s is NOT in local history — commits made on the "
-                         "other machine (check bundles/ in the zip)." % zip_sha[:9])
+            lines.append(f"{_SIDE} HEAD %s is NOT in local history — commits made on the "
+                         f"other machine (check bundles/ in the {_SIDE})." % zip_sha[:9])
             return status, lines, info
         info['known'] = True
         ahead = repo.git.rev_list('--count', f'{zip_sha}..HEAD')
         behind = repo.git.rev_list('--count', f'HEAD..{zip_sha}')
         info['ahead'], info['behind'] = int(ahead), int(behind)
-        lines.append(f"local ahead by {ahead}, behind by {behind} (vs zip {zip_sha[:9]})")
+        lines.append(f"local ahead by {ahead}, behind by {behind} (vs {_SIDE} {zip_sha[:9]})")
         if int(ahead):
             lines.append('')
             lines.append('── commits only in local workspace ──')
             lines += repo.git.log('--oneline', f'{zip_sha}..HEAD').splitlines()[:20]
         if int(behind):
             lines.append('')
-            lines.append('── commits only in zip ──')
+            lines.append(f'── commits only in {_SIDE} ──')
             lines += repo.git.log('--oneline', f'HEAD..{zip_sha}').splitlines()[:20]
     except Exception as e:
         lines.append(f'(could not inspect local repo: {e})')
@@ -2193,14 +2278,14 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             n['act'] = {'kind': 'bundle', 'repo': lpath,
                         'zip': os.path.abspath(zip_path),
                         'member': bmeta['file'], 'zip_sha': zsha}
-            n['detail'] += ['', "t/m on this repo node FETCHES the zip's bundle into the",
+            n['detail'] += ['', f"t/m on this repo node FETCHES the {_SIDE}'s bundle into the",
                             'repo (refs only, no working-tree change); the reloaded tree',
                             'then shows the commits and offers the merge.']
         elif cinfo['known'] and cinfo['behind']:
             n['act'] = {'kind': 'commits', 'repo': lpath, 'zip_sha': zsha,
                         'ahead': cinfo['ahead'], 'behind': cinfo['behind']}
             how = ('fast-forward' if not cinfo['ahead'] else 'merge commit')
-            n['detail'] += ['', 't/m on this repo node MERGES the zip commits into the local',
+            n['detail'] += ['', f't/m on this repo node MERGES the {_SIDE} commits into the local',
                             f'branch ({how}); undo with git reset --hard ORIG_HEAD.']
             if not cinfo['ahead']:
                 ok, why, plan = _ff_plan(lpath, zsha)
@@ -2216,7 +2301,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
                                     'on top:' % len(plan['kept'])] + \
                                    ['    ' + p for p in plan['kept'][:10]]
         elif cstatus != 'same' and not cinfo['known'] and not bmeta:
-            n['detail'] += ['', 'No bundle for this repo in the zip: the exporter saw these',
+            n['detail'] += ['', f'No bundle for this repo in the {_SIDE}: the exporter saw these',
                             "commits on the repo's remote. Pull them with:",
                             '',
                             f'    git -C {lpath} fetch origin',
@@ -2292,7 +2377,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         root['label'] = (f"{os.path.basename(zip_path)}  ==  {workspace}"
                          "  (nothing left to take)")
     root['detail'] = ([
-        '✓ NOTHING LEFT TO TAKE FROM THE ZIP — remaining differences (if any)',
+        f'✓ NOTHING LEFT TO TAKE FROM THE {_SIDE.upper()} — remaining differences (if any)',
         '  are local-only work, which is never touched.',
         '',
     ] if in_sync else []) + [
@@ -2300,17 +2385,19 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         f"exported:  {src}  @  {zm['date'] or '?'}",
         f"workspace: {workspace}",
         '',
-        'repos: %d in zip, %d compared, %d local-only skipped' % (
+        f'repos: %d in {_SIDE}, %d compared, %d local-only skipped' % (
             len(zrepos), len(set(zrepos) & set(local_repos)), len(local_only)),
-        'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
+        f'summary: +%(+)d only-in-{_SIDE}, ~%(~)d differ, =%(=)d in sync' % summary,
         '',
-        'legend: + only in zip   - only local   ^ local ahead   ~ differs',
+        f'legend: + only in {_SIDE}   - only local   ^ local ahead   ~ differs',
         '        = in sync   ✓ resolved   ! conflict/clash',
         'colors: a parent takes the WORST status beneath it, by this priority',
         '        (low to high):  = in sync  <  ✓ resolved  <  - local-only change',
         '        <  ^ local ahead  <  + to take  <  ~ differs  <  ! needs you',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
-        'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
+        'merge:  d diff/preview   o checkout --ours (keep local)   t checkout',
+    f'        --theirs (take {_SIDE})   m merge 3-way   M merge all',
+    '        (the bottom bar always shows the keys valid for the selected node)',
     '        u = safe batch update: apply every NON-conflicting zip change',
     '        (3-way merge; conflicting files stay untouched, then walk them with o/t/m)',
         '        after every action the diff RELOADS from disk (r = reload manually);',
@@ -2321,6 +2408,17 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         '        bundled commits, then (after reload) t merges them — ff when possible',
     ]
     return root
+
+
+# What the "theirs" side of the diff tree is called in every label and hint.
+# 'zip' for real exports; the no-zip upstream mode sets 'remote' so the tree
+# does not talk about a zip that never existed.
+_SIDE = 'zip'
+
+
+def set_side_label(label):
+    global _SIDE
+    _SIDE = label
 
 
 _STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' ',
@@ -2728,7 +2826,7 @@ def apply_action(node, mode, ctx):
         if mode == 'ours':
             return _finish(node, 'done', 'kept local')
         _write_local(ctx, act['local_path'], act['zip_text'])
-        return _finish(node, 'done', 'took zip version')
+        return _finish(node, 'done', f'took {_SIDE} version')
 
     if kind == 'bundle':
         if mode == 'ours':
@@ -2780,7 +2878,7 @@ def apply_action(node, mode, ctx):
                     f.write(raw)
             else:
                 _write_local(ctx, local_path, ztext or '')
-            return _finish(node, 'done', 'took zip version')
+            return _finish(node, 'done', f'took {_SIDE} version')
         lb, ltext, _ = _untracked_text(le)
         if zb or lb:
             return _finish(node, 'conflict', 'binary differs — pick o/t')
@@ -2813,7 +2911,7 @@ def apply_action(node, mode, ctx):
                            % ('its base commit' if act.get('zip_sha') else 'local HEAD'))
         if mode == 'theirs':                 # take zip side wholesale
             _write_local(ctx, local_path, theirs)
-            return _finish(node, 'done', 'took zip version')
+            return _finish(node, 'done', f'took {_SIDE} version')
         try:
             ours = open(local_path, encoding='utf-8', errors='replace').read()
         except OSError:
@@ -3153,7 +3251,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                 flatten(c, depth + 1, out)
         return out
 
-    LEGEND = [('+ only in zip', 'added'), ('- only local', 'removed'),
+    LEGEND = [(f'+ only in {_SIDE}', 'added'), ('- only local', 'removed'),
               ('^ local ahead', 'ahead'), ('~ differs', 'changed'),
               ('= in sync', 'same'), ('✓ resolved', 'done'),
               ('! conflict', 'conflict')]
@@ -3243,8 +3341,29 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             except curses.error:
                 pass
             x += len(text) + 3
-        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M all  u update  r reload  q quit' % (
-            sel + 1, len(rows))
+        # context-sensitive action bar: only the keys valid for the SELECTED
+        # node, named after the git operation each one performs
+        node_sel = rows[sel][0] if sel < len(rows) else None
+        act = (node_sel.get('act') or {}) if node_sel else {}
+        kind = act.get('kind')
+        st = node_sel['status'] if node_sel else 'info'
+        if not act:
+            here = '(no action here)'
+        elif st == 'done':
+            here = '(resolved)'
+        elif st == 'conflict':
+            here = '(conflict: edit the file, then r)'
+        elif st == 'same':
+            here = '(in sync)'
+        elif kind == 'bundle':
+            here = 't/m fetch (bundle)   o skip'
+        elif kind == 'commits':
+            here = ('d log   t/m merge --ff-only   o keep' if not act.get('ahead')
+                    else 'd merge preview   t/m merge   o keep')
+        else:   # patch / untracked / plainfile
+            here = 'd diff   o checkout --ours   t checkout --theirs   m merge (3-way)'
+        status = ' %d/%d │ %s │ u apply all   M merge all   r refresh   q quit' % (
+            sel + 1, len(rows), here)
         try:
             stdscr.addnstr(maxy - 1, 0, status.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
         except curses.error:
@@ -3392,7 +3511,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                         ord('m'): 'merge', ord('M'): 'merge'}[ch]
                 target = root if ch == ord('M') else node
                 what = 'EVERYTHING' if ch == ord('M') else target['label'].split('  (')[0]
-                verb = {'ours': 'keep LOCAL side for', 'theirs': 'take ZIP side for',
+                verb = {'ours': 'keep LOCAL side for', 'theirs': f'take {_SIDE.upper()} side for',
                         'merge': '3-way merge'}[mode]
                 if mode == 'ours' or confirm(stdscr, f'{verb} {what}? files will be '
                                                      f'modified (backup kept)'):
@@ -3406,7 +3525,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                     curses.flushinp()  # drop keys typed while the UI was busy
                 detail_off = 0
             elif ch == ord('u') and ctx is not None and updater is not None:
-                if confirm(stdscr, 'apply ALL non-conflicting zip changes? '
+                if confirm(stdscr, f'apply ALL non-conflicting {_SIDE} changes? '
                                    'conflicts stay untouched (backup kept)'):
                     busy(stdscr, 'applying all non-conflicting changes…')
                     try:
@@ -3465,6 +3584,7 @@ _AUTH_FAIL_PATTERNS = (
 _PULL_STATUS_STYLE = {   # status -> (glyph, ansi color name)
     'up-to-date':  ('=', 'gray'),
     'pulled':      ('✓', 'bgreen'),   # auto-pulled -- the thing to see
+    'fetched':     ('v', 'bgreen'),   # --fetch: new commits available, not merged
     'ahead':       ('^', 'yellow'),
     'diverged':    ('!', 'magenta'),
     'blocked':     ('!', 'magenta'),
@@ -3572,19 +3692,24 @@ def stage_tmux_command(command, window_name, session=None, prefix='pull-'):
     window = _sanitize_tmux_name(window_name, prefix=prefix)
     has = subprocess.run(['tmux', 'has-session', '-t', session], capture_output=True)
     if has.returncode != 0:
-        subprocess.run(['tmux', 'new-session', '-d', '-s', session], capture_output=True)
-    existing = subprocess.run(['tmux', 'list-windows', '-t', session, '-F', '#W'],
-                              capture_output=True).stdout.decode('utf-8', 'replace').splitlines()
-    if window in existing:
-        return session, window, False, f'already staged in {session}:{window}'
-    subprocess.run(['tmux', 'new-window', '-d', '-t', session, '-n', window],
-                   capture_output=True)
+        # name the INITIAL window for this repo -- new-session always creates
+        # one, and leaving it as a bare 'bash' just parks an empty first tab
+        subprocess.run(['tmux', 'new-session', '-d', '-s', session, '-n', window],
+                       capture_output=True)
+    else:
+        existing = subprocess.run(['tmux', 'list-windows', '-t', session, '-F', '#W'],
+                                  capture_output=True).stdout.decode('utf-8', 'replace').splitlines()
+        if window in existing:
+            return session, window, False, f'already staged in {session}:{window}'
+        subprocess.run(['tmux', 'new-window', '-d', '-t', session, '-n', window],
+                       capture_output=True)
     subprocess.run(['tmux', 'send-keys', '-t', f'{session}:{window}', command],
                    capture_output=True)
     return session, window, True, f'staged in {session}:{window} — review and press Enter there'
 
 
-def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
+def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False,
+              fetch_only=False):
     """Pull ONE repo: fetch its upstream (non-interactively; auth needs stage
     a tmux window instead of failing silently), then fast-forward when it's
     now strictly behind (reusing the same dirty-preserving ff as --update-
@@ -3592,7 +3717,9 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
     uncommitted; anything else blocks and is reported, never guessed at).
     Diverged repos are reported, not auto-merged -- a real merge commit stays
     an explicit decision, same as the zip-diff side of this tool.
-    Returns a result dict: {rel, status, note, tmux}."""
+    fetch_only stops after the fetch: remote refs update, HEAD/branch/worktree
+    are never touched, and the result just reports ahead/behind ('fetched'
+    when new commits arrived). Returns {rel, status, note, tmux}."""
     up = _repo_upstream(repo_path)
     if up is None:
         return {'rel': rel, 'status': 'no-upstream',
@@ -3609,7 +3736,8 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
             return {'rel': rel, 'status': 'auth',
                     'note': f'needs authentication ({note}) -- would stage a tmux window',
                     'tmux': None}
-        cmd = f'git -C {shlex.quote(repo_path)} pull'
+        cmd = (f'git -C {shlex.quote(repo_path)} fetch {shlex.quote(remote)}'
+               if fetch_only else f'git -C {shlex.quote(repo_path)} pull')
         session, window, _fresh, stage_note = stage_tmux_command(
             cmd, rel, session=tmux_session)
         return {'rel': rel, 'status': 'auth',
@@ -3627,6 +3755,17 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
                                 capture_output=True).stdout.decode().strip() or 0)
     if not ahead and not behind:
         return {'rel': rel, 'status': 'up-to-date', 'note': '', 'tmux': None}
+    if fetch_only:
+        # report-only: the fetch already happened, nothing else may move
+        if ahead and behind:
+            st, n = 'diverged', (f'local ahead {ahead}, behind {behind} '
+                                 f'(fetched, not merged)')
+        elif behind:
+            st, n = 'fetched', (f'{behind} new commit(s) on {upstream_ref} '
+                                '(not merged -- fetch only)')
+        else:
+            st, n = 'ahead', f'{ahead} local commit(s) not on {upstream_ref}'
+        return {'rel': rel, 'status': st, 'note': n, 'tmux': None}
     if ahead and behind:
         return {'rel': rel, 'status': 'diverged',
                 'note': f'local ahead {ahead}, behind {behind} -- merge is a '
@@ -3660,11 +3799,13 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
 
 
 def pull_workspace(workspace, include_paths=None, repos_filter=None,
-                   tmux_session=None, dry_run=False):
+                   tmux_session=None, dry_run=False, fetch_only=False):
     """Pull every repo under workspace/src (or a `repos_filter` subset of
     them -- 'selected'). Prints a colored status line per repo as it's
     processed (auto-pulls in green, auth-needed in red -- the request this
-    was built for) and a final summary. Returns the list of result dicts."""
+    was built for) and a final summary. fetch_only = update remote refs and
+    report ahead/behind, never touch branches/worktrees.
+    Returns the list of result dicts."""
     source_folder = os.path.join(workspace, 'src')
     if not os.path.isdir(source_folder):
         source_folder = workspace
@@ -3685,12 +3826,13 @@ def pull_workspace(workspace, include_paths=None, repos_filter=None,
         print('No repos to pull.')
         return []
 
-    print(f"Pulling {len(repos)} repo(s){' (dry run)' if dry_run else ''}:")
+    verb = 'Fetching' if fetch_only else 'Pulling'
+    print(f"{verb} {len(repos)} repo(s){' (dry run)' if dry_run else ''}:")
     ctx = _MergeCtx(workspace)
     results = []
     for rel in sorted(repos):
         res = pull_repo(repos[rel], rel, ctx=ctx, tmux_session=tmux_session,
-                        dry_run=dry_run)
+                        dry_run=dry_run, fetch_only=fetch_only)
         results.append(res)
         glyph, colname = _PULL_STATUS_STYLE.get(res['status'], ('?', None))
         line = f"  {glyph} {rel}"
@@ -4098,9 +4240,13 @@ Examples:
     parser.add_argument('--list-pipelines', action='store_true',
                         help='List pipelines stored under ~/.config/ros_vcs/pipeline '
                              '(each in its own git repo, one commit per imported snapshot)')
-    parser.add_argument('--diff-state', metavar='ZIP',
+    parser.add_argument('--diff-state', metavar='ZIP', nargs='?', const='',
                         help='Diff an exported .workspace.zip/.pipeline.zip against a live '
-                             'workspace, browsable as a tree (curses TUI on a terminal)')
+                             'workspace, browsable as a tree (curses TUI on a terminal). '
+                             'WITHOUT a zip: diff against each repo\'s upstream instead -- '
+                             'unpushed commits, uncommitted files, and (after --fetch) '
+                             'incoming remote commits. Put the flag last, or its value '
+                             'swallows the next argument.')
     parser.add_argument('--no-tui', action='store_true',
                         help='With --diff-state: print the tree instead of the interactive TUI')
     parser.add_argument('--diff-json', metavar='FILE',
@@ -4137,13 +4283,18 @@ Examples:
                              "against its OWN remote. A repo blocked on an interactive SSH/"
                              'credential prompt gets the real pull command staged (unexecuted) '
                              'in a tmux window instead of hanging or failing silently.')
+    parser.add_argument('--fetch', action='store_true',
+                        help='Like --pull but FETCH ONLY: update every repo\'s remote refs and '
+                             'report ahead/behind -- branches and working trees are never '
+                             'touched. Same --repos/pipeline slicing and tmux-staged auth.')
     parser.add_argument('--repos', metavar='REPO[,REPO...]',
-                        help='With --pull/--push: only these repos (src-relative paths), '
-                             'instead of all')
+                        help='With --pull/--fetch/--push: only these repos (src-relative '
+                             'paths), instead of all')
     parser.add_argument('--tmux-session', metavar='NAME',
-                        help='With --pull/--push: tmux session to stage auth-blocked commands '
-                             'into (default: for --pull the session this process runs in, else '
-                             '"rvcs-pull"; for --push a fresh "push-<timestamp>" session)')
+                        help='With --pull/--fetch/--push: tmux session to stage auth-blocked '
+                             'commands into (default: for --pull/--fetch the session this '
+                             'process runs in, else "rvcs-pull"; for --push a fresh '
+                             '"push-<timestamp>" session)')
     parser.add_argument('--push', action='store_true',
                         help='Commit any uncommitted work (message written by the claude CLI), '
                              'then push each repo to its own remote. Auth-blocked pushes are '
@@ -4220,10 +4371,18 @@ Examples:
     # matches a stored pipeline — and never for --import-state, whose
     # positional is an output directory that may not exist yet.
     if args.workspace and not args.import_state and not args.pipeline \
-            and os.sep not in args.workspace and not os.path.isdir(args.workspace) \
-            and args.workspace in list_pipeline_names():
-        args.pipeline = pipeline_source_path(args.workspace)
-        args.workspace = None
+            and os.sep not in args.workspace and not os.path.isdir(args.workspace):
+        if args.workspace in list_pipeline_names():
+            args.pipeline = pipeline_source_path(args.workspace)
+            args.workspace = None
+        else:
+            # a bare token that is neither a directory nor a stored pipeline
+            # can only produce an empty status table -- fail loudly instead
+            known = list_pipeline_names()
+            print(f"'{args.workspace}' is neither a directory nor a stored pipeline.")
+            print('Known pipelines: ' + (', '.join(known) if known else '(none)')
+                  + f'   (store: {PIPELINE_CONFIG_DIR})')
+            exit(1)
 
     # Handle --push mode
     if args.push:
@@ -4246,8 +4405,8 @@ Examples:
         exit(1 if any(r['status'] in ('error', 'commit-failed')
                       for r in results) else 0)
 
-    # Handle --pull mode
-    if args.pull:
+    # Handle --pull / --fetch mode
+    if args.pull or args.fetch:
         include = None
         workspace = args.workspace
         if args.pipeline:
@@ -4261,7 +4420,8 @@ Examples:
             repos_filter = {r.strip() for r in args.repos.split(',') if r.strip()}
         results = pull_workspace(workspace, include_paths=include,
                                  repos_filter=repos_filter,
-                                 tmux_session=args.tmux_session, dry_run=args.dry_run)
+                                 tmux_session=args.tmux_session, dry_run=args.dry_run,
+                                 fetch_only=args.fetch)
         exit(1 if any(r['status'] == 'error' for r in results) else 0)
 
     # Handle --update-state mode
@@ -4295,10 +4455,17 @@ Examples:
         exit(0)
 
     # Handle --diff-state mode
-    if args.diff_state:
+    if args.diff_state is not None:
         if args.compare or args.json or args.import_state or args.export_state or args.export_pipeline:
             print("Cannot use other options with --diff-state")
             exit(1)
+        # `rvcs --diff-state flipper_eval` -- nargs='?' swallowed the pipeline
+        # name as the zip value; recognize a stored name and shift it over
+        if args.diff_state and not os.path.exists(os.path.expanduser(args.diff_state)) \
+                and os.sep not in args.diff_state and not args.pipeline \
+                and args.diff_state in list_pipeline_names():
+            args.pipeline = pipeline_source_path(args.diff_state)
+            args.diff_state = ''
         include = None
         workspace = args.workspace
         if args.pipeline:
@@ -4307,7 +4474,16 @@ Examples:
             if workspace is None:
                 workspace = p.get('workspace')
         workspace = workspace or os.getcwd()
-        zip_arg = os.path.expanduser(args.diff_state)
+        tmp_state = None
+        if args.diff_state:
+            zip_arg = os.path.expanduser(args.diff_state)
+        else:
+            zip_arg = make_upstream_state_zip(workspace, include_paths=include)
+            tmp_state = os.path.dirname(zip_arg)
+            set_side_label('upstream')   # git's own name for the tracking ref:
+            # the locally-fetched origin/<branch>, not the live network remote
+            print('No zip given -- diffing against each repo\'s upstream '
+                  '(run --fetch first for fresh remote refs).')
         root = compute_state_diff(zip_arg, workspace, include_paths=include)
         if args.diff_json:
             payload = json.dumps(diff_tree_to_json(root, zip_arg, workspace), indent=2)
@@ -4325,6 +4501,8 @@ Examples:
                                                             include_paths=include),
                          updater=lambda c: update_workspace_state(
                              zip_arg, workspace, include_paths=include, ctx=c))
+        if tmp_state:
+            shutil.rmtree(tmp_state, ignore_errors=True)
         exit(0)
 
     # Handle --export-pipeline mode
@@ -4340,6 +4518,14 @@ Examples:
         if args.compare or args.json or args.import_state:
             print("Cannot use other options with --export-state")
             exit(1)
+        if args.pipeline:
+            # `rvcs <name> --export-state` / `--pipeline X --export-state`:
+            # exporting "the state" of a pipeline IS a pipeline export — slice
+            # to its repos and carry the definition + tmuxinator configs.
+            # Without this, the bare-name shortcut had nulled args.workspace
+            # and this would silently export the CWD as a full workspace.
+            export_pipeline_state(args.pipeline, workspace_path=args.workspace)
+            exit(0)
         workspace = args.workspace if args.workspace else os.getcwd()
         ignore = load_ignore_packages(args.ignore) if args.ignore else None
         if ignore:
@@ -4560,11 +4746,11 @@ Examples:
                     if os.sep in rel:
                         result[0] = rel
                     row_colors = []
-                    if result[3] == 'yes' and result[4] == 'yes':
+                    if result[3] == 'yes' and result[4] != 'no':
                         row_colors = ['\033[38;5;196m'] * len(result)
                     elif result[3] == 'yes':
                         row_colors = ['\033[38;5;208m'] * len(result)
-                    elif result[4] == 'yes':
+                    elif result[4] != 'no':
                         row_colors = ['\033[38;5;70m'] * len(result)
                     else:
                         row_colors = [''] * len(result)
