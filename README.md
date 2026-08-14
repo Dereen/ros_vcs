@@ -15,6 +15,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Colcon config**: `colcon_defaults.yaml` / `.colcon/config.yaml` travel with the export, so a workspace pins its own build settings instead of every importer passing them by hand
 - **Git-bundle fallback**: Repos whose HEAD no remote can serve (unpushed commits, no remote, or a configured remote that doesn't exist) are embedded in the zip as git bundles, so exports are restorable without pushing first
 - **Pull all/selected**: Fetch + fast-forward every repo (or a chosen subset) against its own remote; a repo blocked on an interactive auth prompt gets the real command staged, unexecuted, in a tmux window instead of hanging
+- **Push all/selected**: Commit uncommitted work with a `claude`-authored commit message, then push; auth-blocked pushes are staged in a `push-<timestamp>` tmux session, and auto-commit refuses on credential-looking or implausibly large change sets
 
 ## Installation
 
@@ -413,9 +414,49 @@ immediately instead of hanging), then:
   of clobbering a passphrase you're mid-typing into it.
 
 Colored when stdout is a terminal (`NO_COLOR` respected); a plain summary
-line and per-repo status otherwise. `--push` exists as a stub (`git push`
-being unattended is a bigger decision than an unattended fetch) — not
-implemented yet.
+line and per-repo status otherwise.
+
+### Push every repo (committing uncommitted work first)
+
+The other direction: commit whatever is uncommitted — with a commit message
+written by the `claude` CLI — then push each repo to its own remote.
+
+```bash
+./rvcs.py --push ~/marv_ws --dry-run    # what it would commit and push
+./rvcs.py --push ~/marv_ws              # commit + push
+./rvcs.py --push ~/marv_ws --repos foo,bar
+./rvcs.py --push ~/marv_ws --no-auto-commit   # push existing commits only
+```
+
+Per repo:
+
+1. **Uncommitted work** → the diff and `git status` are handed to
+   `claude -p` (headless, run in an empty temp dir — a message-writing step
+   has no business editing the tree it describes), and the reply becomes the
+   commit message, with a `Commit-message-by: Claude Code (rvcs --push)`
+   trailer recording that the *message* — not the code — was generated.
+   Set `RVCS_CLAUDE_CMD` to use a different binary/wrapper.
+2. **Push** (`✓`), non-interactively, never `--force`.
+3. **`A` red — needs authentication**: same staging as `--pull`, but into a
+   dedicated `push-<timestamp>` tmux session (one window per repo, created
+   only if something actually needs it). `tmux attach -t push-…`, review the
+   `git push`, press Enter.
+4. **`!` rejected**: the remote has commits you don't. Reported, never
+   forced — `rvcs --pull` first.
+
+Auto-commit **refuses** rather than guessing when:
+
+- a changed path looks like a credential (`.env`, `id_ed25519`, `*.pem`,
+  `*secret*`, …; `*.pub` is exempt) — a false positive costs one manual
+  commit, a false negative publishes a key;
+- more than `--max-commit-files` paths changed (default 100), which usually
+  means an accidentally-tracked `build/` tree rather than a real change;
+- the `claude` CLI is missing, times out (`--claude-timeout`, default 180s),
+  or returns something that isn't a commit message.
+
+In every refusal the work is left exactly as it was and the reason is
+printed. `--dry-run` reports the same decisions — including the commit it
+*would* make and the resulting push count — without writing anything.
 
 ### Compare Workspaces
 

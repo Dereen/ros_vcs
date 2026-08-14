@@ -3558,17 +3558,18 @@ def _sanitize_tmux_name(name, prefix='pull-', max_len=40):
     return (prefix + safe)[:max_len]
 
 
-def stage_tmux_command(command, window_name, session=None):
+def stage_tmux_command(command, window_name, session=None, prefix='pull-'):
     """Stage `command` in a tmux window WITHOUT running it -- send-keys with
     no trailing Enter, exactly the pattern used throughout this project for
     anything needing a passphrase Claude cannot type. Reuses an existing
     window of the same name instead of clobbering it (it may already have a
-    partially-typed passphrase in it).
+    partially-typed passphrase in it). `prefix` labels the window by operation
+    so a pull and a push of the same repo do not collide.
     Returns (session, window, freshly_staged: bool, note)."""
     if not _tmux_available():
         return None, None, False, 'tmux is not installed -- cannot stage'
     session = session or _current_tmux_session() or 'rvcs-pull'
-    window = _sanitize_tmux_name(window_name)
+    window = _sanitize_tmux_name(window_name, prefix=prefix)
     has = subprocess.run(['tmux', 'has-session', '-t', session], capture_output=True)
     if has.returncode != 0:
         subprocess.run(['tmux', 'new-session', '-d', '-s', session], capture_output=True)
@@ -3715,6 +3716,352 @@ def pull_workspace(workspace, include_paths=None, repos_filter=None,
     return results
 
 
+# ---------------------------------------------------------------------------
+# --push: commit what's uncommitted (message authored by the claude CLI), then
+# push to the repo's own remote. Auth-blocked pushes are staged in a tmux
+# window exactly like --pull does -- same reasoning: this process has no
+# passphrase to give, so the human gets the real command to run.
+#
+# Push is the destructive direction, so the guard rails differ from --pull:
+# never --force, never push a diverged branch (the remote has commits you
+# don't -- pull first), and auto-commit REFUSES rather than guesses when the
+# change set looks like credentials or is implausibly large (a workspace with
+# an accidentally-tracked build/ tree should not become one giant commit).
+# ---------------------------------------------------------------------------
+
+_PUSH_REJECT_PATTERNS = (
+    'non-fast-forward',
+    'fetch first',
+    'rejected',
+    'behind its remote counterpart',
+    'updates were rejected',
+)
+
+_PUSH_STATUS_STYLE = {   # status -> (glyph, ansi color name)
+    'pushed':       ('✓', 'bgreen'),   # the thing to see
+    'up-to-date':   ('=', 'gray'),
+    'auth':         ('A', 'bred'),     # needs a human at a terminal
+    'rejected':     ('!', 'magenta'),  # remote ahead -- pull first
+    'dirty':        ('~', 'yellow'),   # uncommitted work left behind
+    'needs-human':  ('!', 'magenta'),  # auto-commit refused on purpose
+    'commit-failed': ('E', 'red'),
+    'error':        ('E', 'red'),
+    'no-upstream':  ('·', 'gray'),
+}
+
+# Basenames that must never be swept into an auto-generated commit. Matched on
+# the basename so a path like config/secrets/db.env is caught too.
+_SECRET_NAME_RE = re.compile(
+    r'(^|[._-])(secret|secrets|credential|credentials|password|passwd|token)s?([._-]|$)'
+    r'|^\.env($|\.)'
+    r'|^\.netrc$'
+    r'|^id_(rsa|dsa|ecdsa|ed25519)$'
+    r'|\.(pem|key|p12|pfx|jks|keystore)$',
+    re.IGNORECASE)
+
+
+def _secret_risk_paths(paths):
+    """Paths whose NAME suggests credentials. Deliberately name-based only:
+    an auto-commit path must not need to read file contents to decide, and a
+    false positive here costs one manual commit while a false negative
+    publishes a key."""
+    risky = []
+    for p in paths:
+        base = os.path.basename(p)
+        if base.endswith('.pub'):     # public half of a keypair is not secret
+            continue
+        if _SECRET_NAME_RE.search(base):
+            risky.append(p)
+    return risky
+
+
+def _dirty_paths(repo_path):
+    """Every path `git add -A` would stage, from --porcelain (handles renames
+    and quoted names)."""
+    r = subprocess.run(['git', '-C', repo_path, 'status', '--porcelain'],
+                       capture_output=True)
+    paths = []
+    for line in r.stdout.decode('utf-8', 'replace').splitlines():
+        if not line.strip():
+            continue
+        p = line[3:].split(' -> ')[-1].strip().strip('"')
+        if p:
+            paths.append(p)
+    return paths
+
+
+def _commit_context(repo_path, max_diff_chars=40000):
+    """What the message author needs: the porcelain status plus the tracked
+    diff, truncated (a commit message does not improve past a point, and the
+    prompt has to stay well inside ARG_MAX)."""
+    def out(*a):
+        return subprocess.run(['git', '-C', repo_path] + list(a),
+                              capture_output=True).stdout.decode('utf-8', 'replace')
+
+    status = out('status', '--porcelain')
+    has_head = subprocess.run(['git', '-C', repo_path, 'rev-parse', '--verify', '-q', 'HEAD'],
+                              capture_output=True).returncode == 0
+    diff = out('diff', 'HEAD') if has_head else out('diff', '--cached')
+    truncated = False
+    if len(diff) > max_diff_chars:
+        diff = diff[:max_diff_chars]
+        truncated = True
+    untracked = out('ls-files', '--others', '--exclude-standard')
+    parts = [f'--- git status --porcelain ---\n{status}']
+    if untracked.strip():
+        parts.append(f'--- new (untracked) files ---\n{untracked}')
+    parts.append(f'--- diff of tracked changes ---\n{diff}'
+                 + ('\n[diff truncated]' if truncated else ''))
+    return '\n'.join(parts)
+
+
+_COMMIT_PROMPT = """\
+Write a git commit message for the changes below.
+
+Rules:
+- Output ONLY the commit message. No preamble, no explanation, no markdown fences.
+- First line: imperative mood, <= 72 characters, no trailing period.
+- Then a blank line, then a short body (wrapped at 72) explaining WHY, only if
+  the reason is not obvious from the subject. Omit the body for trivial changes.
+- Describe what the change accomplishes, not a file-by-file listing.
+
+Repository: {rel}
+
+{context}
+"""
+
+
+def _claude_commit_message(rel, context, timeout=180):
+    """Author a commit message by invoking the claude CLI headlessly.
+
+    Runs in an EMPTY temporary directory, not the repo: everything it needs is
+    in the prompt, and a message-writing step has no business reading or
+    editing the working tree it is about to describe.
+    Returns (message, error): exactly one is None."""
+    cmd = os.environ.get('RVCS_CLAUDE_CMD', 'claude')
+    argv = shlex.split(cmd) + ['-p', _COMMIT_PROMPT.format(rel=rel, context=context),
+                               '--output-format', 'text']
+    if not shutil.which(shlex.split(cmd)[0]):
+        return None, f"'{shlex.split(cmd)[0]}' not found on PATH (set RVCS_CLAUDE_CMD)"
+    try:
+        with tempfile.TemporaryDirectory(prefix='rvcs_commitmsg_') as td:
+            r = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=td)
+    except subprocess.TimeoutExpired:
+        return None, f'claude timed out after {timeout}s'
+    except Exception as e:
+        return None, f'claude invocation failed: {e}'
+    if r.returncode != 0:
+        err = r.stderr.decode('utf-8', 'replace').strip().splitlines()
+        return None, f"claude exited {r.returncode}: {err[-1] if err else 'no output'}"
+    msg = r.stdout.decode('utf-8', 'replace').strip()
+    # tolerate a fenced reply even though the prompt forbids it
+    if msg.startswith('```'):
+        lines = msg.splitlines()
+        if len(lines) >= 2:
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith('```'):
+                lines = lines[:-1]
+            msg = '\n'.join(lines).strip()
+    if not msg:
+        return None, 'claude returned an empty message'
+    if len(msg) > 4000 or len(msg.splitlines()[0]) > 200:
+        return None, 'claude returned something that is not a commit message'
+    return msg, None
+
+
+def auto_commit_repo(repo_path, rel, dry_run=False, claude_timeout=180,
+                     max_files=100):
+    """Commit everything uncommitted, with a claude-authored message.
+    Returns (status, note): status in 'committed' | 'needs-human' |
+    'commit-failed' | 'nothing' ('needs-human' = deliberately refused)."""
+    paths = _dirty_paths(repo_path)
+    if not paths:
+        return 'nothing', ''
+
+    risky = _secret_risk_paths(paths)
+    if risky:
+        return 'needs-human', ('refusing to auto-commit: %d path(s) look like '
+                               'credentials (e.g. %s) -- commit by hand'
+                               % (len(risky), risky[0]))
+    if len(paths) > max_files:
+        return 'needs-human', ('refusing to auto-commit %d changed path(s) '
+                               '(limit %d -- an accidentally-tracked build tree '
+                               'would become one giant commit); commit by hand '
+                               'or raise --max-commit-files' % (len(paths), max_files))
+    if dry_run:
+        return 'committed', (f'would auto-commit {len(paths)} path(s) with a '
+                             'claude-authored message')
+
+    msg, err = _claude_commit_message(rel, _commit_context(repo_path),
+                                      timeout=claude_timeout)
+    if msg is None:
+        return 'commit-failed', f'no commit message: {err}'
+    # provenance: the CHANGES are the user's, only the message is generated --
+    # say exactly that rather than claiming co-authorship of the code
+    body = msg + '\n\nCommit-message-by: Claude Code (rvcs --push)\n'
+
+    if subprocess.run(['git', '-C', repo_path, 'add', '-A'],
+                      capture_output=True).returncode != 0:
+        return 'commit-failed', 'git add -A failed'
+    ident = []
+    if not subprocess.run(['git', '-C', repo_path, 'config', 'user.email'],
+                          capture_output=True).stdout.strip():
+        ident = ['-c', 'user.name=rvcs', '-c', 'user.email=rvcs@localhost']
+    r = subprocess.run(['git'] + ident + ['-C', repo_path, 'commit', '-F', '-'],
+                       input=body.encode(), capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).decode('utf-8', 'replace').strip().splitlines()
+        return 'commit-failed', f"git commit failed: {err[-1] if err else '?'}"
+    sha = subprocess.run(['git', '-C', repo_path, 'rev-parse', '--short', 'HEAD'],
+                         capture_output=True).stdout.decode().strip()
+    subject = msg.splitlines()[0]
+    return 'committed', f'committed {len(paths)} path(s) as {sha}: {subject}'
+
+
+def _push_repo(repo_path):
+    """One `git push` to the branch's upstream, non-interactively (same prompt
+    blocking as _fetch_repo, so an auth-needing push fails here instead of
+    hanging). Never --force, never a refspec that could delete anything.
+    Returns ('ok'|'auth'|'rejected'|'error', note)."""
+    env = os.environ.copy()
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    pinned = subprocess.run(['git', '-C', repo_path, 'config', '--get',
+                             'core.sshCommand'], capture_output=True)
+    base_ssh = pinned.stdout.decode('utf-8', 'replace').strip() or 'ssh'
+    env['GIT_SSH_COMMAND'] = f'{base_ssh} -o BatchMode=yes -o ConnectTimeout=10'
+    try:
+        r = subprocess.run(['git', '-C', repo_path, 'push'],
+                           capture_output=True, env=env, timeout=120)
+    except subprocess.TimeoutExpired:
+        return 'error', 'push timed out after 120s'
+    if r.returncode == 0:
+        return 'ok', ''
+    text = (r.stderr + r.stdout).decode('utf-8', 'replace')
+    low = text.lower()
+    if any(p in low for p in _AUTH_FAIL_PATTERNS):
+        return 'auth', (text.strip().splitlines() or ['auth failed'])[-1]
+    if any(p in low for p in _PUSH_REJECT_PATTERNS):
+        return 'rejected', 'remote has commits you do not -- rvcs --pull first'
+    return 'error', (text.strip().splitlines() or [f'exit {r.returncode}'])[-1]
+
+
+def push_repo(repo_path, rel, tmux_session=None, dry_run=False,
+              auto_commit=True, claude_timeout=180, max_files=100):
+    """Commit-if-needed then push ONE repo. Returns {rel, status, note, tmux}."""
+    up = _repo_upstream(repo_path)
+    if up is None:
+        return {'rel': rel, 'status': 'no-upstream',
+                'note': 'current branch has no configured upstream -- '
+                        'git push -u <remote> <branch> once, by hand',
+                'tmux': None}
+    remote, upstream_ref = up
+
+    notes = []
+    would_commit = False
+    if _dirty_paths(repo_path):
+        if auto_commit:
+            cstatus, cnote = auto_commit_repo(
+                repo_path, rel, dry_run=dry_run, claude_timeout=claude_timeout,
+                max_files=max_files)
+            if cstatus in ('needs-human', 'commit-failed'):
+                return {'rel': rel, 'status': cstatus, 'note': cnote, 'tmux': None}
+            # in a dry run nothing was actually committed, so the commit the
+            # real run WOULD make has to be counted by hand below -- otherwise
+            # the preview reports "nothing to push" for a repo the real run
+            # would happily push
+            would_commit = dry_run and cstatus == 'committed'
+            if cnote:
+                notes.append(cnote)
+        else:
+            notes.append('uncommitted changes left alone (--no-auto-commit)')
+
+    ahead = int(subprocess.run(['git', '-C', repo_path, 'rev-list', '--count',
+                                f'{upstream_ref}..HEAD'],
+                               capture_output=True).stdout.decode().strip() or 0)
+    pending = ahead + (1 if would_commit else 0)
+    if not pending:
+        # nothing local to publish; a still-dirty tree is worth flagging
+        status = 'dirty' if _dirty_paths(repo_path) else 'up-to-date'
+        notes.append('nothing to push' if status == 'up-to-date'
+                     else 'nothing committed to push, working tree still dirty')
+        return {'rel': rel, 'status': status, 'note': '; '.join(notes), 'tmux': None}
+
+    if dry_run:
+        notes.append(f'would push {pending} commit(s) to {upstream_ref}')
+        return {'rel': rel, 'status': 'pushed', 'note': '; '.join(notes), 'tmux': None}
+
+    kind, note = _push_repo(repo_path)
+    if kind == 'ok':
+        notes.append(f'pushed {ahead} commit(s) to {upstream_ref}')
+        return {'rel': rel, 'status': 'pushed', 'note': '; '.join(notes), 'tmux': None}
+    if kind == 'auth':
+        cmd = f'git -C {shlex.quote(repo_path)} push'
+        session, window, _fresh, stage_note = stage_tmux_command(
+            cmd, rel, session=tmux_session, prefix='push-')
+        notes.append(f'needs authentication ({note}) -- {stage_note}')
+        return {'rel': rel, 'status': 'auth', 'note': '; '.join(notes),
+                'tmux': f'{session}:{window}' if session else None}
+    notes.append(note)
+    return {'rel': rel, 'status': 'rejected' if kind == 'rejected' else 'error',
+            'note': '; '.join(notes), 'tmux': None}
+
+
+def push_workspace(workspace, include_paths=None, repos_filter=None,
+                   tmux_session=None, dry_run=False, auto_commit=True,
+                   claude_timeout=180, max_files=100):
+    """Push every repo under workspace/src (or a subset). Auth-blocked pushes
+    are staged in a dedicated `push-<timestamp>` tmux session (created lazily,
+    only if something actually needs it)."""
+    source_folder = os.path.join(workspace, 'src')
+    if not os.path.isdir(source_folder):
+        source_folder = workspace
+    color = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+
+    repos = {}
+    for p in find_git_repos(source_folder):
+        rel = os.path.relpath(p, source_folder)
+        if repo_in_include_paths(rel, include_paths):
+            repos[rel] = p
+    if repos_filter:
+        for m in [r for r in repos_filter if r not in repos]:
+            print(_color(f'  ! {m}: not found under {source_folder}', 'red', color))
+        repos = {r: p for r, p in repos.items() if r in repos_filter}
+
+    if not repos:
+        print('No repos to push.')
+        return []
+
+    session = tmux_session or ('push-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+    print(f"Pushing {len(repos)} repo(s){' (dry run)' if dry_run else ''}"
+          f"{'' if auto_commit else ', auto-commit off'}:")
+    results = []
+    for rel in sorted(repos):
+        res = push_repo(repos[rel], rel, tmux_session=session, dry_run=dry_run,
+                        auto_commit=auto_commit, claude_timeout=claude_timeout,
+                        max_files=max_files)
+        results.append(res)
+        glyph, colname = _PUSH_STATUS_STYLE.get(res['status'], ('?', None))
+        line = f"  {glyph} {rel}"
+        if res['note']:
+            line += f"  -- {res['note']}"
+        print(_color(line, colname, color))
+
+    counts = {}
+    for r in results:
+        counts[r['status']] = counts.get(r['status'], 0) + 1
+    print('\n' + '  '.join(f"{_PUSH_STATUS_STYLE.get(k, ('?', None))[0]} {k}: {v}"
+                           for k, v in sorted(counts.items())))
+    auth_repos = [r for r in results if r['status'] == 'auth']
+    if auth_repos:
+        print(_color(f"\n{len(auth_repos)} repo(s) need authentication -- "
+                     f"tmux session '{session}', one window each; review the "
+                     "staged command and press Enter:", 'bred', color))
+        for r in auth_repos:
+            print(_color(f"  A {r['rel']}: {r['tmux']}", 'bred', color))
+        print(_color(f"  tmux attach -t {session}", 'bred', color))
+    return results
+
+
 def main():
     """Main entry point for CLI."""
     global _debug
@@ -3791,12 +4138,27 @@ Examples:
                              'credential prompt gets the real pull command staged (unexecuted) '
                              'in a tmux window instead of hanging or failing silently.')
     parser.add_argument('--repos', metavar='REPO[,REPO...]',
-                        help='With --pull: only these repos (src-relative paths), instead of all')
+                        help='With --pull/--push: only these repos (src-relative paths), '
+                             'instead of all')
     parser.add_argument('--tmux-session', metavar='NAME',
-                        help='With --pull: tmux session to stage auth-blocked pulls into '
-                             '(default: the session this process runs in, else "rvcs-pull")')
+                        help='With --pull/--push: tmux session to stage auth-blocked commands '
+                             'into (default: for --pull the session this process runs in, else '
+                             '"rvcs-pull"; for --push a fresh "push-<timestamp>" session)')
     parser.add_argument('--push', action='store_true',
-                        help='Not implemented yet -- reserved for a future push counterpart to --pull')
+                        help='Commit any uncommitted work (message written by the claude CLI), '
+                             'then push each repo to its own remote. Auth-blocked pushes are '
+                             'staged (unexecuted) in a push-<timestamp> tmux session. Never '
+                             'force-pushes; a diverged branch is reported, not forced.')
+    parser.add_argument('--no-auto-commit', action='store_true',
+                        help='With --push: do not commit uncommitted work, only push what is '
+                             'already committed')
+    parser.add_argument('--claude-timeout', type=int, default=180, metavar='SECONDS',
+                        help='With --push: seconds to wait for the claude CLI to author a '
+                             'commit message (default 180)')
+    parser.add_argument('--max-commit-files', type=int, default=100, metavar='N',
+                        help='With --push: refuse to auto-commit more than N changed paths '
+                             '(default 100 — guards against sweeping in an accidentally-'
+                             'tracked build tree)')
     parser.add_argument('workspace', nargs='?', default=None, help='Workspace folder or output dir')
     args = parser.parse_args()
 
@@ -3863,11 +4225,26 @@ Examples:
         args.pipeline = pipeline_source_path(args.workspace)
         args.workspace = None
 
+    # Handle --push mode
     if args.push:
-        print("--push is not implemented yet. --pull (fetch + fast-forward, with "
-              "tmux-staged auth) is available; a push counterpart is planned but "
-              "not built -- pushing stays a manual `git push` for now.")
-        exit(1)
+        include = None
+        workspace = args.workspace
+        if args.pipeline:
+            p = load_pipeline(os.path.expanduser(args.pipeline))
+            include = p['repos'] or None
+            if workspace is None:
+                workspace = p.get('workspace')
+        workspace = workspace or os.getcwd()
+        repos_filter = None
+        if args.repos:
+            repos_filter = {r.strip() for r in args.repos.split(',') if r.strip()}
+        results = push_workspace(
+            workspace, include_paths=include, repos_filter=repos_filter,
+            tmux_session=args.tmux_session, dry_run=args.dry_run,
+            auto_commit=not args.no_auto_commit,
+            claude_timeout=args.claude_timeout, max_files=args.max_commit_files)
+        exit(1 if any(r['status'] in ('error', 'commit-failed')
+                      for r in results) else 0)
 
     # Handle --pull mode
     if args.pull:
