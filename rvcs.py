@@ -1772,7 +1772,7 @@ def make_upstream_state_zip(workspace, include_paths=None):
             continue
         repos[rel] = {'type': 'git', 'url': url, 'version': ver}
     tmp = tempfile.mkdtemp(prefix='rvcs_upstreamdiff_')
-    zpath = os.path.join(tmp, 'upstream-state.zip')
+    zpath = os.path.join(tmp, 'upstream (origin refs)')
     with zipfile.ZipFile(zpath, 'w') as zf:
         zf.writestr('workspace.repos', yaml.safe_dump({'repositories': repos}))
         zf.writestr('workspace.state.yaml', yaml.safe_dump({
@@ -1925,22 +1925,22 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             state = zip_change_state(path, zp)
             if state == 'contained':
                 counts['='] += 1
-                nodes.append(_node(f"{path}  (zip change already in local)", 'same',
-                                   ["The zip's uncommitted patch is already contained in the",
+                nodes.append(_node(f"{path}  ({_SIDE} change already in local)", 'same',
+                                   [f"The {_SIDE}'s uncommitted patch is already contained in the",
                                     'local file (committed or applied here since the export).',
                                     ''] + zp.splitlines()))
             elif state == 'conflict':
                 counts['~'] += 1
-                nodes.append(_node(f"{path}  (zip change CONFLICTS with local version)",
+                nodes.append(_node(f"{path}  ({_SIDE} change CONFLICTS with local version)",
                                    'clash',
-                                   ["The zip's patch collides with changes made here since the",
+                                   [f"The {_SIDE}'s patch collides with changes made here since the",
                                     'export — u skips this file. d previews the merge with',
                                     'markers; then m (merge), o (keep local) or t (zip version).',
                                     '', '── patch in zip ──'] + zp.splitlines()))
             else:
                 counts['+'] += 1
-                nodes.append(_node(f"{path}  (modified only in zip)", 'added',
-                                   ['── patch in zip ──'] + zp.splitlines()))
+                nodes.append(_node(f"{path}  (modified only in {_SIDE})", 'added',
+                                   [f'── patch in {_SIDE} ──'] + zp.splitlines()))
         elif lp is not None and zp is None:
             counts['-'] += 1
             nodes.append(_node(f"{path}  (modified only locally)", 'removed',
@@ -1949,9 +1949,9 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
             state = zip_change_state(path, zp)
             if state == 'contained':
                 counts['='] += 1
-                nodes.append(_node(f"{path}  (zip change contained; local has own edits)",
+                nodes.append(_node(f"{path}  ({_SIDE} change contained; local has own edits)",
                                    'same',
-                                   ["The zip's patch is already contained in the local file;",
+                                   [f"The {_SIDE}'s patch is already contained in the local file;",
                                     'the remaining difference is local-only work.',
                                     '', '── patch in zip ──'] + zp.splitlines() +
                                    ['', '── patch in local workspace ──'] + lp.splitlines()))
@@ -2007,7 +2007,7 @@ def _diff_repo_files(zdirty, ldirty, repo_path=None, zip_sha=None):
                 counts['+'] += 1
                 detail = ['── new file, only in zip ──'] + \
                          (['<binary, %d bytes>' % zsize] if zb else (ztext or '').splitlines())
-                nodes.append(_node(f"{label_path}  (only in zip)", 'added', detail))
+                nodes.append(_node(f"{label_path}  (only in {_SIDE})", 'added', detail))
         elif le is not None and ze is None:
             lb, ltext, lsize = _untracked_text(le)
             counts['-'] += 1
@@ -2120,19 +2120,19 @@ def _commit_nodes(repo_path, zip_sha, cinfo):
         stat = subprocess.run(['git', '-C', repo_path, 'show', '--stat',
                                '--oneline', zip_sha], capture_output=True)
         nodes.append(_node(
-            f"commits only in zip ({len(incoming)})", 'added',
+            f"commits only in {_SIDE} ({len(incoming)})", 'added',
             incoming + ['', '── newest incoming commit ──'] +
             stat.stdout.decode('utf-8', 'replace').splitlines()[:40]))
     if cinfo['ahead']:
         mine = log(f'{zip_sha}..HEAD')
         nodes.append(_node(f"commits only local ({len(mine)})", 'ahead',
-                           ['Your work — the zip has none of it; never touched.',
+                           [f'Your work — the {_SIDE} has none of it; never touched.',
                             ''] + mine))
     if cinfo['behind'] and cinfo['ahead']:
         dry = _merge_dry_run(repo_path, zip_sha)
         if dry is not None:
             c, cl = dry['conflicts'], dry['clean']
-            det = ['Merging the zip commits into your branch would:', '']
+            det = [f'Merging the {_SIDE} commits into your branch would:', '']
             if c:
                 det.append('CONFLICT — needs hand-resolution (%d file(s)):' % len(c))
                 det += ['    ! %s  (%d hunk(s))' % (f, dry['hunks'].get(f, 0))
@@ -2164,21 +2164,21 @@ def _repo_commit_info(repo_path, zip_sha):
         try:
             repo.commit(zip_sha)  # is the zip commit known locally?
         except Exception:
-            lines.append("zip HEAD %s is NOT in local history — commits made on the "
-                         "other machine (check bundles/ in the zip)." % zip_sha[:9])
+            lines.append(f"{_SIDE} HEAD %s is NOT in local history — commits made on the "
+                         f"other machine (check bundles/ in the {_SIDE})." % zip_sha[:9])
             return status, lines, info
         info['known'] = True
         ahead = repo.git.rev_list('--count', f'{zip_sha}..HEAD')
         behind = repo.git.rev_list('--count', f'HEAD..{zip_sha}')
         info['ahead'], info['behind'] = int(ahead), int(behind)
-        lines.append(f"local ahead by {ahead}, behind by {behind} (vs zip {zip_sha[:9]})")
+        lines.append(f"local ahead by {ahead}, behind by {behind} (vs {_SIDE} {zip_sha[:9]})")
         if int(ahead):
             lines.append('')
             lines.append('── commits only in local workspace ──')
             lines += repo.git.log('--oneline', f'{zip_sha}..HEAD').splitlines()[:20]
         if int(behind):
             lines.append('')
-            lines.append('── commits only in zip ──')
+            lines.append(f'── commits only in {_SIDE} ──')
             lines += repo.git.log('--oneline', f'HEAD..{zip_sha}').splitlines()[:20]
     except Exception as e:
         lines.append(f'(could not inspect local repo: {e})')
@@ -2278,14 +2278,14 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
             n['act'] = {'kind': 'bundle', 'repo': lpath,
                         'zip': os.path.abspath(zip_path),
                         'member': bmeta['file'], 'zip_sha': zsha}
-            n['detail'] += ['', "t/m on this repo node FETCHES the zip's bundle into the",
+            n['detail'] += ['', f"t/m on this repo node FETCHES the {_SIDE}'s bundle into the",
                             'repo (refs only, no working-tree change); the reloaded tree',
                             'then shows the commits and offers the merge.']
         elif cinfo['known'] and cinfo['behind']:
             n['act'] = {'kind': 'commits', 'repo': lpath, 'zip_sha': zsha,
                         'ahead': cinfo['ahead'], 'behind': cinfo['behind']}
             how = ('fast-forward' if not cinfo['ahead'] else 'merge commit')
-            n['detail'] += ['', 't/m on this repo node MERGES the zip commits into the local',
+            n['detail'] += ['', f't/m on this repo node MERGES the {_SIDE} commits into the local',
                             f'branch ({how}); undo with git reset --hard ORIG_HEAD.']
             if not cinfo['ahead']:
                 ok, why, plan = _ff_plan(lpath, zsha)
@@ -2301,7 +2301,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
                                     'on top:' % len(plan['kept'])] + \
                                    ['    ' + p for p in plan['kept'][:10]]
         elif cstatus != 'same' and not cinfo['known'] and not bmeta:
-            n['detail'] += ['', 'No bundle for this repo in the zip: the exporter saw these',
+            n['detail'] += ['', f'No bundle for this repo in the {_SIDE}: the exporter saw these',
                             "commits on the repo's remote. Pull them with:",
                             '',
                             f'    git -C {lpath} fetch origin',
@@ -2377,7 +2377,7 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         root['label'] = (f"{os.path.basename(zip_path)}  ==  {workspace}"
                          "  (nothing left to take)")
     root['detail'] = ([
-        '✓ NOTHING LEFT TO TAKE FROM THE ZIP — remaining differences (if any)',
+        f'✓ NOTHING LEFT TO TAKE FROM THE {_SIDE.upper()} — remaining differences (if any)',
         '  are local-only work, which is never touched.',
         '',
     ] if in_sync else []) + [
@@ -2385,18 +2385,18 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         f"exported:  {src}  @  {zm['date'] or '?'}",
         f"workspace: {workspace}",
         '',
-        'repos: %d in zip, %d compared, %d local-only skipped' % (
+        f'repos: %d in {_SIDE}, %d compared, %d local-only skipped' % (
             len(zrepos), len(set(zrepos) & set(local_repos)), len(local_only)),
-        'summary: +%(+)d only-in-zip, ~%(~)d differ, =%(=)d in sync' % summary,
+        f'summary: +%(+)d only-in-{_SIDE}, ~%(~)d differ, =%(=)d in sync' % summary,
         '',
-        'legend: + only in zip   - only local   ^ local ahead   ~ differs',
+        f'legend: + only in {_SIDE}   - only local   ^ local ahead   ~ differs',
         '        = in sync   ✓ resolved   ! conflict/clash',
         'colors: a parent takes the WORST status beneath it, by this priority',
         '        (low to high):  = in sync  <  ✓ resolved  <  - local-only change',
         '        <  ^ local ahead  <  + to take  <  ~ differs  <  ! needs you',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
         'merge:  d diff/preview   o checkout --ours (keep local)   t checkout',
-    '        --theirs (take zip)   m merge 3-way   M merge all',
+    f'        --theirs (take {_SIDE})   m merge 3-way   M merge all',
     '        (the bottom bar always shows the keys valid for the selected node)',
     '        u = safe batch update: apply every NON-conflicting zip change',
     '        (3-way merge; conflicting files stay untouched, then walk them with o/t/m)',
@@ -2408,6 +2408,17 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         '        bundled commits, then (after reload) t merges them — ff when possible',
     ]
     return root
+
+
+# What the "theirs" side of the diff tree is called in every label and hint.
+# 'zip' for real exports; the no-zip upstream mode sets 'remote' so the tree
+# does not talk about a zip that never existed.
+_SIDE = 'zip'
+
+
+def set_side_label(label):
+    global _SIDE
+    _SIDE = label
 
 
 _STATUS_GLYPH = {'added': '+', 'removed': '-', 'changed': '~', 'same': '=', 'info': ' ',
@@ -2815,7 +2826,7 @@ def apply_action(node, mode, ctx):
         if mode == 'ours':
             return _finish(node, 'done', 'kept local')
         _write_local(ctx, act['local_path'], act['zip_text'])
-        return _finish(node, 'done', 'took zip version')
+        return _finish(node, 'done', f'took {_SIDE} version')
 
     if kind == 'bundle':
         if mode == 'ours':
@@ -2867,7 +2878,7 @@ def apply_action(node, mode, ctx):
                     f.write(raw)
             else:
                 _write_local(ctx, local_path, ztext or '')
-            return _finish(node, 'done', 'took zip version')
+            return _finish(node, 'done', f'took {_SIDE} version')
         lb, ltext, _ = _untracked_text(le)
         if zb or lb:
             return _finish(node, 'conflict', 'binary differs — pick o/t')
@@ -2900,7 +2911,7 @@ def apply_action(node, mode, ctx):
                            % ('its base commit' if act.get('zip_sha') else 'local HEAD'))
         if mode == 'theirs':                 # take zip side wholesale
             _write_local(ctx, local_path, theirs)
-            return _finish(node, 'done', 'took zip version')
+            return _finish(node, 'done', f'took {_SIDE} version')
         try:
             ours = open(local_path, encoding='utf-8', errors='replace').read()
         except OSError:
@@ -3240,7 +3251,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                 flatten(c, depth + 1, out)
         return out
 
-    LEGEND = [('+ only in zip', 'added'), ('- only local', 'removed'),
+    LEGEND = [(f'+ only in {_SIDE}', 'added'), ('- only local', 'removed'),
               ('^ local ahead', 'ahead'), ('~ differs', 'changed'),
               ('= in sync', 'same'), ('✓ resolved', 'done'),
               ('! conflict', 'conflict')]
@@ -3500,7 +3511,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                         ord('m'): 'merge', ord('M'): 'merge'}[ch]
                 target = root if ch == ord('M') else node
                 what = 'EVERYTHING' if ch == ord('M') else target['label'].split('  (')[0]
-                verb = {'ours': 'keep LOCAL side for', 'theirs': 'take ZIP side for',
+                verb = {'ours': 'keep LOCAL side for', 'theirs': f'take {_SIDE.upper()} side for',
                         'merge': '3-way merge'}[mode]
                 if mode == 'ours' or confirm(stdscr, f'{verb} {what}? files will be '
                                                      f'modified (backup kept)'):
@@ -3514,7 +3525,7 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
                     curses.flushinp()  # drop keys typed while the UI was busy
                 detail_off = 0
             elif ch == ord('u') and ctx is not None and updater is not None:
-                if confirm(stdscr, 'apply ALL non-conflicting zip changes? '
+                if confirm(stdscr, f'apply ALL non-conflicting {_SIDE} changes? '
                                    'conflicts stay untouched (backup kept)'):
                     busy(stdscr, 'applying all non-conflicting changes…')
                     try:
@@ -4091,6 +4102,7 @@ Examples:
         else:
             zip_arg = make_upstream_state_zip(workspace, include_paths=include)
             tmp_state = os.path.dirname(zip_arg)
+            set_side_label('remote')
             print('No zip given -- diffing against each repo\'s upstream '
                   '(run --fetch first for fresh remote refs).')
         root = compute_state_diff(zip_arg, workspace, include_paths=include)
