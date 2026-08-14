@@ -15,6 +15,7 @@ A command-line tool for managing ROS/catkin workspaces with multiple git reposit
 - **Colcon config**: `colcon_defaults.yaml` / `.colcon/config.yaml` travel with the export, so a workspace pins its own build settings instead of every importer passing them by hand
 - **Git-bundle fallback**: Repos whose HEAD no remote can serve (unpushed commits, no remote, or a configured remote that doesn't exist) are embedded in the zip as git bundles, so exports are restorable without pushing first
 - **Pull all/selected**: Fetch + fast-forward every repo (or a chosen subset) against its own remote; a repo blocked on an interactive auth prompt gets the real command staged, unexecuted, in a tmux window instead of hanging
+- **Fetch only** (`--fetch`): same sweep and auth staging, but stops after updating remote refs — reports ahead/behind per repo, never touches a branch or working tree
 
 ## Installation
 

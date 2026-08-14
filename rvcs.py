@@ -3465,6 +3465,7 @@ _AUTH_FAIL_PATTERNS = (
 _PULL_STATUS_STYLE = {   # status -> (glyph, ansi color name)
     'up-to-date':  ('=', 'gray'),
     'pulled':      ('✓', 'bgreen'),   # auto-pulled -- the thing to see
+    'fetched':     ('v', 'bgreen'),   # --fetch: new commits available, not merged
     'ahead':       ('^', 'yellow'),
     'diverged':    ('!', 'magenta'),
     'blocked':     ('!', 'magenta'),
@@ -3583,7 +3584,8 @@ def stage_tmux_command(command, window_name, session=None):
     return session, window, True, f'staged in {session}:{window} — review and press Enter there'
 
 
-def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
+def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False,
+              fetch_only=False):
     """Pull ONE repo: fetch its upstream (non-interactively; auth needs stage
     a tmux window instead of failing silently), then fast-forward when it's
     now strictly behind (reusing the same dirty-preserving ff as --update-
@@ -3591,7 +3593,9 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
     uncommitted; anything else blocks and is reported, never guessed at).
     Diverged repos are reported, not auto-merged -- a real merge commit stays
     an explicit decision, same as the zip-diff side of this tool.
-    Returns a result dict: {rel, status, note, tmux}."""
+    fetch_only stops after the fetch: remote refs update, HEAD/branch/worktree
+    are never touched, and the result just reports ahead/behind ('fetched'
+    when new commits arrived). Returns {rel, status, note, tmux}."""
     up = _repo_upstream(repo_path)
     if up is None:
         return {'rel': rel, 'status': 'no-upstream',
@@ -3608,7 +3612,8 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
             return {'rel': rel, 'status': 'auth',
                     'note': f'needs authentication ({note}) -- would stage a tmux window',
                     'tmux': None}
-        cmd = f'git -C {shlex.quote(repo_path)} pull'
+        cmd = (f'git -C {shlex.quote(repo_path)} fetch {shlex.quote(remote)}'
+               if fetch_only else f'git -C {shlex.quote(repo_path)} pull')
         session, window, _fresh, stage_note = stage_tmux_command(
             cmd, rel, session=tmux_session)
         return {'rel': rel, 'status': 'auth',
@@ -3626,6 +3631,17 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
                                 capture_output=True).stdout.decode().strip() or 0)
     if not ahead and not behind:
         return {'rel': rel, 'status': 'up-to-date', 'note': '', 'tmux': None}
+    if fetch_only:
+        # report-only: the fetch already happened, nothing else may move
+        if ahead and behind:
+            st, n = 'diverged', (f'local ahead {ahead}, behind {behind} '
+                                 f'(fetched, not merged)')
+        elif behind:
+            st, n = 'fetched', (f'{behind} new commit(s) on {upstream_ref} '
+                                '(not merged -- fetch only)')
+        else:
+            st, n = 'ahead', f'{ahead} local commit(s) not on {upstream_ref}'
+        return {'rel': rel, 'status': st, 'note': n, 'tmux': None}
     if ahead and behind:
         return {'rel': rel, 'status': 'diverged',
                 'note': f'local ahead {ahead}, behind {behind} -- merge is a '
@@ -3659,11 +3675,13 @@ def pull_repo(repo_path, rel, ctx=None, tmux_session=None, dry_run=False):
 
 
 def pull_workspace(workspace, include_paths=None, repos_filter=None,
-                   tmux_session=None, dry_run=False):
+                   tmux_session=None, dry_run=False, fetch_only=False):
     """Pull every repo under workspace/src (or a `repos_filter` subset of
     them -- 'selected'). Prints a colored status line per repo as it's
     processed (auto-pulls in green, auth-needed in red -- the request this
-    was built for) and a final summary. Returns the list of result dicts."""
+    was built for) and a final summary. fetch_only = update remote refs and
+    report ahead/behind, never touch branches/worktrees.
+    Returns the list of result dicts."""
     source_folder = os.path.join(workspace, 'src')
     if not os.path.isdir(source_folder):
         source_folder = workspace
@@ -3684,12 +3702,13 @@ def pull_workspace(workspace, include_paths=None, repos_filter=None,
         print('No repos to pull.')
         return []
 
-    print(f"Pulling {len(repos)} repo(s){' (dry run)' if dry_run else ''}:")
+    verb = 'Fetching' if fetch_only else 'Pulling'
+    print(f"{verb} {len(repos)} repo(s){' (dry run)' if dry_run else ''}:")
     ctx = _MergeCtx(workspace)
     results = []
     for rel in sorted(repos):
         res = pull_repo(repos[rel], rel, ctx=ctx, tmux_session=tmux_session,
-                        dry_run=dry_run)
+                        dry_run=dry_run, fetch_only=fetch_only)
         results.append(res)
         glyph, colname = _PULL_STATUS_STYLE.get(res['status'], ('?', None))
         line = f"  {glyph} {rel}"
@@ -3790,8 +3809,12 @@ Examples:
                              "against its OWN remote. A repo blocked on an interactive SSH/"
                              'credential prompt gets the real pull command staged (unexecuted) '
                              'in a tmux window instead of hanging or failing silently.')
+    parser.add_argument('--fetch', action='store_true',
+                        help='Like --pull but FETCH ONLY: update every repo\'s remote refs and '
+                             'report ahead/behind -- branches and working trees are never '
+                             'touched. Same --repos/pipeline slicing and tmux-staged auth.')
     parser.add_argument('--repos', metavar='REPO[,REPO...]',
-                        help='With --pull: only these repos (src-relative paths), instead of all')
+                        help='With --pull/--fetch: only these repos (src-relative paths), instead of all')
     parser.add_argument('--tmux-session', metavar='NAME',
                         help='With --pull: tmux session to stage auth-blocked pulls into '
                              '(default: the session this process runs in, else "rvcs-pull")')
@@ -3869,8 +3892,8 @@ Examples:
               "not built -- pushing stays a manual `git push` for now.")
         exit(1)
 
-    # Handle --pull mode
-    if args.pull:
+    # Handle --pull / --fetch mode
+    if args.pull or args.fetch:
         include = None
         workspace = args.workspace
         if args.pipeline:
@@ -3884,7 +3907,8 @@ Examples:
             repos_filter = {r.strip() for r in args.repos.split(',') if r.strip()}
         results = pull_workspace(workspace, include_paths=include,
                                  repos_filter=repos_filter,
-                                 tmux_session=args.tmux_session, dry_run=args.dry_run)
+                                 tmux_session=args.tmux_session, dry_run=args.dry_run,
+                                 fetch_only=args.fetch)
         exit(1 if any(r['status'] == 'error' for r in results) else 0)
 
     # Handle --update-state mode
