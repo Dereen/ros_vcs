@@ -365,8 +365,28 @@ def get_git_info_dict(folder, debug=False):
         is_dirty = repo.is_dirty(untracked_files=True)
         local_changes = "yes" if is_dirty else "no"
 
-        # Remote changes (for comparison tool, means changes on remote PC, not git remote)
+        # Remote changes: the LOCAL BRANCH vs its upstream tracking ref --
+        # purely local (uses the last fetch, no network). 'N to merge' =
+        # fetched-but-not-merged commits sitting on origin/<branch>; 'N to
+        # push' = local commits the remote lacks. (The compare tool overwrites
+        # this column with its own remote-PC meaning, as before.)
         remote_changes = "no"
+        try:
+            tb = repo.active_branch.tracking_branch()
+            if tb is not None:
+                behind = int(repo.git.rev_list('--count',
+                             f'{repo.active_branch.name}..{tb.name}') or 0)
+                ahead = int(repo.git.rev_list('--count',
+                            f'{tb.name}..{repo.active_branch.name}') or 0)
+                bits = []
+                if behind:
+                    bits.append(f'{behind} to merge')
+                if ahead:
+                    bits.append(f'{ahead} to push')
+                if bits:
+                    remote_changes = ', '.join(bits)
+        except Exception:
+            pass
 
         _debug_print(f"Local changes: {local_changes}")
 
@@ -4335,11 +4355,11 @@ Examples:
                     if os.sep in rel:
                         result[0] = rel
                     row_colors = []
-                    if result[3] == 'yes' and result[4] == 'yes':
+                    if result[3] == 'yes' and result[4] != 'no':
                         row_colors = ['\033[38;5;196m'] * len(result)
                     elif result[3] == 'yes':
                         row_colors = ['\033[38;5;208m'] * len(result)
-                    elif result[4] == 'yes':
+                    elif result[4] != 'no':
                         row_colors = ['\033[38;5;70m'] * len(result)
                     else:
                         row_colors = [''] * len(result)
