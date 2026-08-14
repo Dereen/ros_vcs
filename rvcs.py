@@ -164,15 +164,31 @@ def _pipeline_repo_dir(name):
     return os.path.join(PIPELINE_CONFIG_DIR, name)
 
 
+def _pipeline_yaml_basename(name):
+    """The definition file inside a pipeline's store repo. Canonically
+    <name>.pipeline.yaml, but the DIRECTORY name is the identity the CLI
+    uses — a user renaming the directory must not orphan the store — so
+    fall back to whatever single *.pipeline.yaml the repo carries."""
+    d = _pipeline_repo_dir(name)
+    exact = f'{name}.pipeline.yaml'
+    if os.path.isfile(os.path.join(d, exact)):
+        return exact
+    cands = sorted(f for f in os.listdir(d) if f.endswith(('.pipeline.yaml',
+                                                           '.pipeline.yml'))) \
+        if os.path.isdir(d) else []
+    return cands[0] if cands else exact
+
+
 def _pipeline_file_in_repo(name):
-    return os.path.join(_pipeline_repo_dir(name), f'{name}.pipeline.yaml')
+    return os.path.join(_pipeline_repo_dir(name), _pipeline_yaml_basename(name))
 
 
 def list_pipeline_names():
     """Names of every pipeline in the canonical store — one git repo per
-    name under PIPELINE_CONFIG_DIR. Directories without a .git (or without
-    their own <name>.pipeline.yaml) are not pipelines; skipped rather than
-    erroring, so stray files don't break listing."""
+    DIRECTORY under PIPELINE_CONFIG_DIR (the directory name is the CLI
+    name, surviving renames). Directories without a .git or without any
+    *.pipeline.yaml are not pipelines; skipped rather than erroring, so
+    stray files don't break listing."""
     if not os.path.isdir(PIPELINE_CONFIG_DIR):
         return []
     names = []
@@ -210,7 +226,8 @@ def pipeline_source_path(name):
         hint = ('Known pipelines: ' + ', '.join(known)) if known else \
                f'No pipelines stored yet under {PIPELINE_CONFIG_DIR}.'
         raise FileNotFoundError(f"No pipeline named '{name}' and no such file. {hint}")
-    r = subprocess.run(['git', '-C', repo_dir, 'show', f'HEAD:{name}.pipeline.yaml'],
+    r = subprocess.run(['git', '-C', repo_dir, 'show',
+                        f'HEAD:{_pipeline_yaml_basename(name)}'],
                        capture_output=True)
     if r.returncode != 0:
         raise FileNotFoundError(
@@ -243,15 +260,27 @@ def commit_pipeline_snapshot(name, content_bytes, message, author_date=None):
     was actually exported, not when it happened to be imported; None uses
     now. Returns the short commit hash, or None if nothing changed."""
     import subprocess
-    repo_dir = _pipeline_repo_dir(name)
-    dest = _pipeline_file_in_repo(name)
+    target = name
+    if not os.path.isdir(_pipeline_repo_dir(name)):
+        # a renamed store dir keeps its identity: if some existing pipeline's
+        # definition declares this name, version there instead of forking a
+        # fresh directory next to it
+        for n in list_pipeline_names():
+            try:
+                if load_pipeline(_pipeline_file_in_repo(n)).get('name') == name:
+                    target = n
+                    break
+            except Exception:
+                continue
+    repo_dir = _pipeline_repo_dir(target)
+    dest = _pipeline_file_in_repo(target)
     os.makedirs(repo_dir, exist_ok=True)
     if not os.path.isdir(os.path.join(repo_dir, '.git')):
         subprocess.run(['git', 'init', '-q', '-b', 'main', repo_dir], check=True)
     with open(dest, 'wb') as f:
         f.write(content_bytes)
     ident = _git_identity_args(repo_dir)
-    subprocess.run(['git', '-C', repo_dir, 'add', f'{name}.pipeline.yaml'], check=True)
+    subprocess.run(['git', '-C', repo_dir, 'add', os.path.basename(dest)], check=True)
     if subprocess.run(['git', '-C', repo_dir, 'diff', '--cached', '--quiet']).returncode == 0:
         return None   # identical to HEAD (or an empty repo with nothing staged) -- no-op
     env = dict(os.environ)
@@ -2346,7 +2375,9 @@ def compute_state_diff(zip_path, workspace, include_paths=None):
         '        (low to high):  = in sync  <  ✓ resolved  <  - local-only change',
         '        <  ^ local ahead  <  + to take  <  ~ differs  <  ! needs you',
         'keys:   j/k move   l/Enter expand   h collapse   J/K scroll detail   q quit',
-        'merge:  d preview   o accept ours   t accept theirs   m merge subtree   M merge all',
+        'merge:  d diff/preview   o checkout --ours (keep local)   t checkout',
+    '        --theirs (take zip)   m merge 3-way   M merge all',
+    '        (the bottom bar always shows the keys valid for the selected node)',
     '        u = safe batch update: apply every NON-conflicting zip change',
     '        (3-way merge; conflicting files stay untouched, then walk them with o/t/m)',
         '        after every action the diff RELOADS from disk (r = reload manually);',
@@ -3279,8 +3310,29 @@ def run_diff_tui(root, ctx=None, rebuild=None, updater=None):
             except curses.error:
                 pass
             x += len(text) + 3
-        status = ' %d/%d  j/k l h nav  d preview  o ours  t theirs  m merge  M all  u update  r reload  q quit' % (
-            sel + 1, len(rows))
+        # context-sensitive action bar: only the keys valid for the SELECTED
+        # node, named after the git operation each one performs
+        node_sel = rows[sel][0] if sel < len(rows) else None
+        act = (node_sel.get('act') or {}) if node_sel else {}
+        kind = act.get('kind')
+        st = node_sel['status'] if node_sel else 'info'
+        if not act:
+            here = '(no action here)'
+        elif st == 'done':
+            here = '(resolved)'
+        elif st == 'conflict':
+            here = '(conflict: edit the file, then r)'
+        elif st == 'same':
+            here = '(in sync)'
+        elif kind == 'bundle':
+            here = 't/m fetch (bundle)   o skip'
+        elif kind == 'commits':
+            here = ('d log   t/m merge --ff-only   o keep' if not act.get('ahead')
+                    else 'd merge preview   t/m merge   o keep')
+        else:   # patch / untracked / plainfile
+            here = 'd diff   o checkout --ours   t checkout --theirs   m merge (3-way)'
+        status = ' %d/%d │ %s │ u apply all   M merge all   r refresh   q quit' % (
+            sel + 1, len(rows), here)
         try:
             stdscr.addnstr(maxy - 1, 0, status.ljust(maxx - 1), maxx - 1, curses.A_REVERSE)
         except curses.error:
@@ -3925,10 +3977,18 @@ Examples:
     # matches a stored pipeline — and never for --import-state, whose
     # positional is an output directory that may not exist yet.
     if args.workspace and not args.import_state and not args.pipeline \
-            and os.sep not in args.workspace and not os.path.isdir(args.workspace) \
-            and args.workspace in list_pipeline_names():
-        args.pipeline = pipeline_source_path(args.workspace)
-        args.workspace = None
+            and os.sep not in args.workspace and not os.path.isdir(args.workspace):
+        if args.workspace in list_pipeline_names():
+            args.pipeline = pipeline_source_path(args.workspace)
+            args.workspace = None
+        else:
+            # a bare token that is neither a directory nor a stored pipeline
+            # can only produce an empty status table -- fail loudly instead
+            known = list_pipeline_names()
+            print(f"'{args.workspace}' is neither a directory nor a stored pipeline.")
+            print('Known pipelines: ' + (', '.join(known) if known else '(none)')
+                  + f'   (store: {PIPELINE_CONFIG_DIR})')
+            exit(1)
 
     if args.push:
         print("--push is not implemented yet. --pull (fetch + fast-forward, with "
