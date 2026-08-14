@@ -3572,13 +3572,17 @@ def stage_tmux_command(command, window_name, session=None):
     window = _sanitize_tmux_name(window_name)
     has = subprocess.run(['tmux', 'has-session', '-t', session], capture_output=True)
     if has.returncode != 0:
-        subprocess.run(['tmux', 'new-session', '-d', '-s', session], capture_output=True)
-    existing = subprocess.run(['tmux', 'list-windows', '-t', session, '-F', '#W'],
-                              capture_output=True).stdout.decode('utf-8', 'replace').splitlines()
-    if window in existing:
-        return session, window, False, f'already staged in {session}:{window}'
-    subprocess.run(['tmux', 'new-window', '-d', '-t', session, '-n', window],
-                   capture_output=True)
+        # name the INITIAL window for this repo -- new-session always creates
+        # one, and leaving it as a bare 'bash' just parks an empty first tab
+        subprocess.run(['tmux', 'new-session', '-d', '-s', session, '-n', window],
+                       capture_output=True)
+    else:
+        existing = subprocess.run(['tmux', 'list-windows', '-t', session, '-F', '#W'],
+                                  capture_output=True).stdout.decode('utf-8', 'replace').splitlines()
+        if window in existing:
+            return session, window, False, f'already staged in {session}:{window}'
+        subprocess.run(['tmux', 'new-window', '-d', '-t', session, '-n', window],
+                       capture_output=True)
     subprocess.run(['tmux', 'send-keys', '-t', f'{session}:{window}', command],
                    capture_output=True)
     return session, window, True, f'staged in {session}:{window} — review and press Enter there'
