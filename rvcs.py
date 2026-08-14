@@ -4102,7 +4102,8 @@ Examples:
         else:
             zip_arg = make_upstream_state_zip(workspace, include_paths=include)
             tmp_state = os.path.dirname(zip_arg)
-            set_side_label('remote')
+            set_side_label('upstream')   # git's own name for the tracking ref:
+            # the locally-fetched origin/<branch>, not the live network remote
             print('No zip given -- diffing against each repo\'s upstream '
                   '(run --fetch first for fresh remote refs).')
         root = compute_state_diff(zip_arg, workspace, include_paths=include)
