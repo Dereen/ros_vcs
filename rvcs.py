@@ -143,6 +143,14 @@ def load_pipeline(pipeline_file):
           - ~/.config/tmuxinator/marv_overhang.yml
         extra_paths:                      # optional NON-repo paths (relative to
           - src/marv_elevation_mapping    #   the workspace root) copied raw
+        no_push:                          # repos we cannot publish to (third-
+          - libpointmatcher               #   party upstreams). --push skips
+          - kindr                         #   them entirely: no auto-commit, no
+                                          #   push attempt, and no staged tmux
+                                          #   window for an auth prompt that
+                                          #   could never succeed. Their local
+                                          #   commits travel in exports as git
+                                          #   bundles instead.
 
     Returns the pipeline dict with defaults filled in.
     """
@@ -154,6 +162,7 @@ def load_pipeline(pipeline_file):
     data.setdefault('repos', [])
     data.setdefault('tmuxinator', [])
     data.setdefault('extra_paths', [])
+    data.setdefault('no_push', [])
     if data.get('workspace'):
         data['workspace'] = os.path.expanduser(data['workspace'])
     data['tmuxinator'] = [os.path.expanduser(p) for p in data['tmuxinator']]
@@ -4102,6 +4111,7 @@ _PUSH_REJECT_PATTERNS = (
 )
 
 _PUSH_STATUS_STYLE = {   # status -> (glyph, ansi color name)
+    'no-push-rights': ('·', 'gray'),   # pipeline no_push: not ours to publish
     'pushed':       ('✓', 'bgreen'),   # the thing to see
     'up-to-date':   ('=', 'gray'),
     'auth':         ('A', 'bred'),     # needs a human at a terminal
@@ -4372,10 +4382,16 @@ def push_repo(repo_path, rel, tmux_session=None, dry_run=False,
 
 def push_workspace(workspace, include_paths=None, repos_filter=None,
                    tmux_session=None, dry_run=False, auto_commit=True,
-                   claude_timeout=180, max_files=100):
+                   claude_timeout=180, max_files=100, no_push=None):
     """Push every repo under workspace/src (or a subset). Auth-blocked pushes
     are staged in a dedicated `push-<timestamp>` tmux session (created lazily,
-    only if something actually needs it)."""
+    only if something actually needs it).
+
+    no_push: repos (the pipeline's `no_push:` list) we have no publish rights
+    to -- third-party upstreams. They are dropped before anything happens to
+    them: no auto-commit, no push attempt, and above all no staged tmux
+    window, since a passphrase typed there could never make the push
+    succeed. Their local commits reach other machines as export bundles."""
     source_folder = os.path.join(workspace, 'src')
     if not os.path.isdir(source_folder):
         source_folder = workspace
@@ -4391,11 +4407,22 @@ def push_workspace(workspace, include_paths=None, repos_filter=None,
             print(_color(f'  ! {m}: not found under {source_folder}', 'red', color))
         repos = {r: p for r, p in repos.items() if r in repos_filter}
 
+    skipped_no_push = [rel for rel in sorted(repos)
+                       if no_push and repo_in_include_paths(rel, no_push)]
+    repos = {r: p for r, p in repos.items() if r not in skipped_no_push}
+    no_push_results = [{'rel': r, 'status': 'no-push-rights',
+                        'note': 'no publish rights (pipeline no_push) -- skipped',
+                        'tmux': None} for r in skipped_no_push]
+
     if not repos:
-        print('No repos to push.')
-        return []
+        print('No repos to push.' + (f'  ({len(skipped_no_push)} skipped: no_push)'
+                                     if skipped_no_push else ''))
+        return no_push_results
 
     session = tmux_session or ('push-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+    for rel in skipped_no_push:
+        print(_color(f"  · {rel}  -- no publish rights (pipeline no_push), skipped",
+                     'gray', color))
     print(f"Pushing {len(repos)} repo(s){' (dry run)' if dry_run else ''}"
           f"{'' if auto_commit else ', auto-commit off'}:")
     results = []
@@ -4410,6 +4437,7 @@ def push_workspace(workspace, include_paths=None, repos_filter=None,
             line += f"  -- {res['note']}"
         print(_color(line, colname, color))
 
+    results = no_push_results + results
     counts = {}
     for r in results:
         counts[r['status']] = counts.get(r['status'], 0) + 1
@@ -4610,10 +4638,12 @@ Examples:
     # Handle --push mode
     if args.push:
         include = None
+        no_push = None
         workspace = args.workspace
         if args.pipeline:
             p = load_pipeline(os.path.expanduser(args.pipeline))
             include = p['repos'] or None
+            no_push = p.get('no_push') or None
             if workspace is None:
                 workspace = p.get('workspace')
         workspace = workspace or os.getcwd()
@@ -4624,7 +4654,8 @@ Examples:
             workspace, include_paths=include, repos_filter=repos_filter,
             tmux_session=args.tmux_session, dry_run=args.dry_run,
             auto_commit=not args.no_auto_commit,
-            claude_timeout=args.claude_timeout, max_files=args.max_commit_files)
+            claude_timeout=args.claude_timeout, max_files=args.max_commit_files,
+            no_push=no_push)
         exit(1 if any(r['status'] in ('error', 'commit-failed')
                       for r in results) else 0)
 
