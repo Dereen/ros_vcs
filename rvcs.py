@@ -3909,6 +3909,24 @@ def _sanitize_tmux_name(name, prefix='pull-', max_len=40):
     return (prefix + safe)[:max_len]
 
 
+def next_free_tmux_session(base='push'):
+    """`base` if no such tmux session exists, else base_2, base_3, ... A run's
+    staged commands stay together in one predictable place; a previous run's
+    session is never reused (its windows may still hold a half-typed
+    passphrase) and never clobbered."""
+    existing = set()
+    if _tmux_available():
+        existing = set(subprocess.run(['tmux', 'list-sessions', '-F', '#S'],
+                                      capture_output=True).stdout
+                       .decode('utf-8', 'replace').split())
+    if base not in existing:
+        return base
+    n = 2
+    while f'{base}_{n}' in existing:
+        n += 1
+    return f'{base}_{n}'
+
+
 def stage_tmux_command(command, window_name, session=None, prefix='pull-'):
     """Stage `command` in a tmux window WITHOUT running it -- send-keys with
     no trailing Enter, exactly the pattern used throughout this project for
@@ -4384,8 +4402,8 @@ def push_workspace(workspace, include_paths=None, repos_filter=None,
                    tmux_session=None, dry_run=False, auto_commit=True,
                    claude_timeout=180, max_files=100, no_push=None):
     """Push every repo under workspace/src (or a subset). Auth-blocked pushes
-    are staged in a dedicated `push-<timestamp>` tmux session (created lazily,
-    only if something actually needs it).
+    are staged in a dedicated `push` tmux session (push_2, push_3, ... when
+    that name is taken; created lazily, only if something needs it).
 
     no_push: repos (the pipeline's `no_push:` list) we have no publish rights
     to -- third-party upstreams. They are dropped before anything happens to
@@ -4419,7 +4437,7 @@ def push_workspace(workspace, include_paths=None, repos_filter=None,
                                      if skipped_no_push else ''))
         return no_push_results
 
-    session = tmux_session or ('push-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+    session = tmux_session or next_free_tmux_session('push')
     for rel in skipped_no_push:
         print(_color(f"  · {rel}  -- no publish rights (pipeline no_push), skipped",
                      'gray', color))
@@ -4545,11 +4563,12 @@ Examples:
                         help='With --pull/--fetch/--push: tmux session to stage auth-blocked '
                              'commands into (default: for --pull/--fetch the session this '
                              'process runs in, else "rvcs-pull"; for --push a fresh '
-                             '"push-<timestamp>" session)')
+                             '"push" session, or push_2/3/... if taken)')
     parser.add_argument('--push', action='store_true',
                         help='Commit any uncommitted work (message written by the claude CLI), '
                              'then push each repo to its own remote. Auth-blocked pushes are '
-                             'staged (unexecuted) in a push-<timestamp> tmux session. Never '
+                             'staged (unexecuted) in a "push" tmux session (push_2/3/... if '
+                             'that name is taken). Never '
                              'force-pushes; a diverged branch is reported, not forced.')
     parser.add_argument('--no-auto-commit', action='store_true',
                         help='With --push: do not commit uncommitted work, only push what is '
